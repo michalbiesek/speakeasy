@@ -8,12 +8,12 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/speakeasy-api/openapi-generation/v2/pkg/generate"
 	"github.com/speakeasy-api/sdk-gen-config/workflow"
-	"github.com/speakeasy-api/speakeasy-client-sdk-go/v3/pkg/models/shared"
-	"github.com/speakeasy-api/speakeasy-core/auth"
 	"github.com/speakeasy-api/speakeasy/internal/charm/styles"
 	"github.com/speakeasy-api/speakeasy/internal/env"
+	"github.com/speakeasy-api/speakeasy/internal/links"
 	"github.com/speakeasy-api/speakeasy/internal/log"
 	"github.com/speakeasy-api/speakeasy/internal/utils"
 	"github.com/speakeasy-api/speakeasy/internal/workflowTracking"
@@ -43,6 +43,8 @@ type Runner struct {
 
 	// Enhanced CLI visualization tracker for the workflow.
 	workflowTracker *workflowTracking.WorkflowStep
+
+	testReportURLs []string
 }
 
 // NewRunner creates a new Runner with the given options.
@@ -61,7 +63,7 @@ func NewRunner(ctx context.Context, opts ...RunnerOpt) *Runner {
 
 // Run loads the workflow, loads the generator, and runs target testing.
 func (r *Runner) Run(ctx context.Context) error {
-	if err := r.checkAccountType(ctx); err != nil {
+	if err := CheckTestingEnabled(ctx); err != nil {
 		return err
 	}
 
@@ -100,7 +102,6 @@ func (r *Runner) RunWithVisualization(ctx context.Context) error {
 	}
 
 	err := r.workflowTracker.RunWithVisualization(runFnCli, updatesChannel)
-
 	if err != nil {
 		logger.Errorf("Workflow testing failed: %s", err)
 	}
@@ -114,22 +115,23 @@ func (r *Runner) RunWithVisualization(ctx context.Context) error {
 		logger.PrintlnUnstyled(styles.MakeSection("Workflow testing run logs", output, styles.Colors.Grey))
 	}
 
+	if len(r.testReportURLs) > 0 {
+		msg := "view your test report here"
+		if len(r.testReportURLs) > 1 {
+			msg = "view your test reports here"
+		}
+		shortenedURLs := make([]string, 0, len(r.testReportURLs))
+		for _, url := range r.testReportURLs {
+			shortenedURLs = append(shortenedURLs, links.Shorten(ctx, url))
+		}
+		if runErr != nil {
+			logger.Println("\n\n" + styles.RenderErrorMessage("Tests Failed - "+msg, lipgloss.Center, shortenedURLs...))
+		} else {
+			logger.Println("\n\n" + styles.RenderSuccessMessage("Tests Succeeded - "+msg, shortenedURLs...))
+		}
+	}
+
 	return errors.Join(err, runErr)
-}
-
-// Checks the account type to ensure testing is enabled.
-func (r *Runner) checkAccountType(ctx context.Context) error {
-	accountType := auth.GetAccountTypeFromContext(ctx)
-
-	if accountType == nil {
-		return fmt.Errorf("Account type not found. Ensure you are logged in via the `speakeasy auth login` command or SPEAKEASY_API_KEY environment variable.")
-	}
-
-	if *accountType != shared.AccountTypeEnterprise {
-		return fmt.Errorf("Testing is not supported on the %s account tier. Contact %s for more information.", *accountType, styles.RenderSupportEmail())
-	}
-
-	return nil
 }
 
 // Discovers the workflow configuration to set the runner project directory and
@@ -138,7 +140,7 @@ func (r *Runner) loadWorkflow() error {
 	wf, projectDir, err := utils.GetWorkflowAndDir()
 
 	if err != nil || wf == nil {
-		return fmt.Errorf("Unable to load workflow configuration (workflow.yaml): %w", err)
+		return fmt.Errorf("unable to load workflow configuration (workflow.yaml): %w", err)
 	}
 
 	r.projectDir = projectDir
@@ -162,6 +164,10 @@ func (r *Runner) prepareGenerator(ctx context.Context) (*generate.Generator, err
 		generate.WithRunLocation(runLocation),
 	}
 
+	if r.disableMockserver {
+		generatorOpts = append(generatorOpts, generate.WithDisableMockServer())
+	}
+
 	// The generator verbose output option, regardless of given value, also
 	// resets the logger in the generator, so only set when enabled. Otherwise,
 	// output can interleave/format incorrectly.
@@ -170,9 +176,8 @@ func (r *Runner) prepareGenerator(ctx context.Context) (*generate.Generator, err
 	}
 
 	generator, err := generate.New(generatorOpts...)
-
 	if err != nil {
-		return nil, fmt.Errorf("Unable to prepare testing instance: %w", err)
+		return nil, fmt.Errorf("unable to prepare testing instance: %w", err)
 	}
 
 	return generator, nil
@@ -187,7 +192,7 @@ func (r *Runner) runWorkflowTargetTesting(ctx context.Context) error {
 	workflowTarget, ok := r.workflow.Targets[r.workflowTarget]
 
 	if !ok {
-		return fmt.Errorf("Workflow target %s not found in configuration.", r.workflowTarget)
+		return fmt.Errorf("workflow target %s not found in configuration", r.workflowTarget)
 	}
 
 	return r.runSingleWorkflowTargetTesting(ctx, r.workflowTarget, workflowTarget)
@@ -227,13 +232,18 @@ func (r *Runner) runSingleWorkflowTargetTesting(ctx context.Context, workflowTar
 	testingCtx := log.With(ctx, testingLogger)
 
 	generator, err := r.prepareGenerator(testingCtx)
-
 	if err != nil {
 		return err
 	}
 
-	if err := generator.RunTargetTesting(testingCtx, workflowTarget.Target, outputDir); err != nil {
-		return fmt.Errorf("error running workflow target %s (%s) testing: %w", workflowTargetName, workflowTarget.Target, err)
+	testReportURL, err := ExecuteTargetTesting(testingCtx, generator, workflowTarget, workflowTargetName, outputDir)
+
+	if testReportURL != "" {
+		r.testReportURLs = append(r.testReportURLs, testReportURL)
+	}
+
+	if err != nil {
+		return fmt.Errorf("error running tests for target %s (%s): %w", workflowTargetName, workflowTarget.Target, err)
 	}
 
 	targetTracker.SucceedWorkflow()

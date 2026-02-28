@@ -2,6 +2,7 @@ package prompts
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"fmt"
 	"os"
@@ -16,6 +17,7 @@ import (
 	config "github.com/speakeasy-api/sdk-gen-config"
 	"github.com/speakeasy-api/sdk-gen-config/workflow"
 	"github.com/speakeasy-api/speakeasy/internal/charm"
+	"github.com/speakeasy-api/speakeasy/internal/log"
 	"gopkg.in/yaml.v3"
 )
 
@@ -37,14 +39,22 @@ const (
 )
 
 var SupportedPublishingTargets = []string{
-	"typescript",
-	"python",
 	"csharp",
-	"ruby",
-	"php",
-	"java",
 	"go",
+	"java",
+	"mcp-typescript",
+	"php",
+	"python",
+	"ruby",
 	"terraform",
+	"typescript",
+}
+
+var SupportedTestingTargets = []string{
+	"go",
+	"java",
+	"python",
+	"typescript",
 }
 
 //go:embed terraform_release.yaml
@@ -103,20 +113,71 @@ func ConfigureGithub(githubWorkflow *config.GenerateWorkflow, workflow *workflow
 	return githubWorkflow, nil
 }
 
-func ConfigurePublishing(target *workflow.Target, name string) (*workflow.Target, error) {
+type ConfigurePublishingOptions struct {
+	PyPITrustedPublishing bool
+}
+
+func ConfigurePublishing(target *workflow.Target, name string, opts ConfigurePublishingOptions) (*workflow.Target, error) {
 	promptMap := make(map[publishingPrompt]*string)
+
+	// If the target already has a publishing definition for the package manager
+	// for the target language, return the target unmodified.
+	hasPublishingDefined := target.Publishing != nil
+
+	if hasPublishingDefined {
+		switch target.Target {
+		case "mcp-typescript", "typescript":
+			if target.Publishing.NPM != nil {
+				return target, nil
+			}
+		case "python":
+			if target.Publishing.PyPi != nil {
+				return target, nil
+			}
+		case "csharp":
+			if target.Publishing.Nuget != nil {
+				return target, nil
+			}
+		case "ruby":
+			if target.Publishing.RubyGems != nil {
+				return target, nil
+			}
+		case "php":
+			if target.Publishing.Packagist != nil {
+				return target, nil
+			}
+		case "java":
+			if target.Publishing.Java != nil {
+				return target, nil
+			}
+		case "terraform":
+			if target.Publishing.Terraform != nil {
+				return target, nil
+			}
+		}
+	}
+
 	switch target.Target {
-	case "typescript":
+	case "mcp-typescript", "typescript":
 		target.Publishing = &workflow.Publishing{
 			NPM: &workflow.NPM{
 				Token: formatWorkflowSecret(npmTokenDefault),
 			},
 		}
 	case "python":
-		target.Publishing = &workflow.Publishing{
-			PyPi: &workflow.PyPi{
-				Token: formatWorkflowSecret(pypiTokenDefault),
-			},
+		if opts.PyPITrustedPublishing {
+			useTrustedPublishing := true
+			target.Publishing = &workflow.Publishing{
+				PyPi: &workflow.PyPi{
+					UseTrustedPublishing: &useTrustedPublishing,
+				},
+			}
+		} else {
+			target.Publishing = &workflow.Publishing{
+				PyPi: &workflow.PyPi{
+					Token: formatWorkflowSecret(pypiTokenDefault),
+				},
+			}
 		}
 	case "csharp":
 		target.Publishing = &workflow.Publishing{
@@ -191,10 +252,14 @@ func executePromptsForPublishing(prompts map[publishingPrompt]*string, target *w
 		)
 	}
 
+	if len(fields) == 0 {
+		return nil
+	}
+
 	var groups []*huh.Group
 	// group two secrets together on a screen
 	for i := 0; i < len(fields); i += 2 {
-		var groupedFields []huh.Field = []huh.Field{
+		groupedFields := []huh.Field{
 			fields[i],
 		}
 
@@ -241,7 +306,7 @@ func FindGithubRepository(outDir string) *git.Repository {
 	if err != nil {
 		return nil
 	}
-	prior := ""
+	var prior string
 	for {
 		if _, err := os.Stat(path.Join(gitFolder, ".git")); err == nil {
 			break
@@ -285,30 +350,25 @@ func ParseGithubRemoteURL(repo *git.Repository) string {
 	}
 
 	remoteCfg, ok := cfg.Remotes[defaultRemote]
-	if !ok {
+	if !ok || len(remoteCfg.URLs) == 0 {
 		return ""
 	}
 
-	for _, url := range remoteCfg.URLs {
-		if strings.Contains(url, "git@github.com") {
-			url = strings.Replace(url, "git@github.com:", "https://github.com/", 1)
-		}
+	url := remoteCfg.URLs[0]
 
-		if strings.HasSuffix(url, ".git") {
-			url = url[:len(url)-4]
-		}
+	url = strings.Replace(strings.TrimSuffix(url, ".git"), "git@github.com:", "https://github.com/", 1)
 
-		return url
-	}
-
-	return ""
+	return url
 }
 
 func getSecretsValuesFromPublishing(publishing workflow.Publishing) []string {
 	secrets := []string{}
 
 	if publishing.PyPi != nil {
-		secrets = append(secrets, publishing.PyPi.Token)
+		// Skip token if using trusted publishing
+		if publishing.PyPi.UseTrustedPublishing == nil || !*publishing.PyPi.UseTrustedPublishing {
+			secrets = append(secrets, publishing.PyPi.Token)
+		}
 	}
 
 	if publishing.NPM != nil {
@@ -343,19 +403,64 @@ func getSecretsValuesFromPublishing(publishing workflow.Publishing) []string {
 	return secrets
 }
 
-// WritePublishing writes a github action file for a given target for publishing to a package manager.
-// If filenameAddendum is provided, it will be appended to the filename (i.e. sdk_publish_lending.yaml).
-// Returns the paths to the files written.
-func WritePublishing(wf *workflow.Workflow, genWorkflow *config.GenerateWorkflow, targetName, currentWorkingDir, workflowFileDir string, target workflow.Target) ([]string, error) {
+func WriteTestingFiles(ctx context.Context, wf *workflow.Workflow, currentWorkingDir, workflowFileDir string, selectedTargets []string, isPatBased bool) ([]string, error) {
 	secrets := make(map[string]string)
 	secrets[config.GithubAccessToken] = formatGithubSecretName(defaultGithubTokenSecretName)
 	secrets[config.SpeakeasyApiKey] = formatGithubSecretName(defaultSpeakeasyAPIKeySecretName)
+	var filePaths []string
+	// Write the appropriate testing files
+	for _, name := range selectedTargets {
+		testingFile := defaultTestingFile(name, wf.Targets[name].Output, workflowFileDir, secrets)
+		filePath := filepath.Join(currentWorkingDir, ".github/workflows/sdk_test.yaml")
+		if len(wf.Targets) > 1 {
+			testingFile.Name = fmt.Sprintf("Test %s", strings.ToUpper(name))
+			sanitizedName := strings.ReplaceAll(strings.ToLower(name), "-", "_")
+			filePath = filepath.Join(currentWorkingDir, fmt.Sprintf(".github/workflows/sdk_test_%s.yaml", sanitizedName))
+		}
+
+		if err := writeTestingFile(testingFile, filePath); err != nil {
+			return nil, err
+		}
+
+		filePaths = append(filePaths, filePath)
+	}
+
+	// Attempt to update the appropriate generation workflow if they choose a PAT based approach
+	if isPatBased {
+		for name := range wf.Targets {
+			generationWorkflow := &config.GenerateWorkflow{}
+			generationWorkflowFilePath := filepath.Join(currentWorkingDir, ".github/workflows/sdk_generation.yaml")
+			if len(wf.Targets) > 1 {
+				sanitizedName := strings.ReplaceAll(strings.ToLower(name), "-", "_")
+				generationWorkflowFilePath = filepath.Join(currentWorkingDir, fmt.Sprintf(".github/workflows/sdk_generation_%s.yaml", sanitizedName))
+			}
+			if err := ReadGenerationFile(generationWorkflow, generationWorkflowFilePath); err == nil {
+				generationWorkflow.Jobs.Generate.Secrets["pr_creation_pat"] = formatGithubSecretName("pr_creation_pat")
+			}
+
+			if err := WriteGenerationFile(generationWorkflow, generationWorkflowFilePath); err != nil {
+				log.From(ctx).Warnf("failed to to update %s with pr_creation_pat", generationWorkflowFilePath)
+			}
+		}
+	}
+
+	return filePaths, nil
+}
+
+// WritePublishing writes a github action file for a given target for publishing to a package manager.
+// If multiple targets are defined in the workflow, the filename will be suffixed with the target name.
+// Returns the paths to the files written.
+func WritePublishing(wf *workflow.Workflow, genWorkflow *config.GenerateWorkflow, targetName, currentWorkingDir, workflowFileDir string, target workflow.Target) ([]string, error) {
+	// Collect publishing-specific secrets (used by both generation and publish workflows)
+	publishingSecrets := make(map[string]string)
+	publishingSecrets[config.GithubAccessToken] = formatGithubSecretName(defaultGithubTokenSecretName)
+	publishingSecrets[config.SpeakeasyApiKey] = formatGithubSecretName(defaultSpeakeasyAPIKeySecretName)
 
 	var terraformOutDir *string
 
 	if target.Publishing != nil {
 		for _, secret := range getSecretsValuesFromPublishing(*target.Publishing) {
-			secrets[formatGithubSecret(secret)] = formatGithubSecretName(secret)
+			publishingSecrets[formatGithubSecret(secret)] = formatGithubSecretName(secret)
 		}
 
 		if target.Target == "terraform" {
@@ -363,11 +468,11 @@ func WritePublishing(wf *workflow.Workflow, genWorkflow *config.GenerateWorkflow
 		}
 	}
 
-	currentSecrets := genWorkflow.Jobs.Generate.Secrets
-	for secret, value := range secrets {
-		currentSecrets[secret] = value
+	// Update generation workflow with publishing secrets
+	genSecrets := genWorkflow.Jobs.Generate.Secrets
+	for name, value := range publishingSecrets {
+		genSecrets[name] = value
 	}
-	genWorkflow.Jobs.Generate.Secrets = currentSecrets
 
 	mode := genWorkflow.Jobs.Generate.With[config.Mode].(string)
 	if target.Target == "terraform" {
@@ -399,7 +504,7 @@ func WritePublishing(wf *workflow.Workflow, genWorkflow *config.GenerateWorkflow
 			publishingFile = defaultPublishingFile()
 		}
 
-		// backfill id-token write permissions
+		// backfill `id-token: write` permission (OIDC)
 		if publishingFile.Permissions.IDToken != config.GithubWritePermission {
 			publishingFile.Permissions.IDToken = config.GithubWritePermission
 		}
@@ -425,8 +530,29 @@ func WritePublishing(wf *workflow.Workflow, genWorkflow *config.GenerateWorkflow
 			publishingFile.Jobs.Publish.With["working_directory"] = workflowFileDir
 		}
 
-		for name, value := range secrets {
-			publishingFile.Jobs.Publish.Secrets[name] = value
+		publishingFile.Jobs.Publish.Secrets = publishingSecrets
+
+		// Add publish-pypi job if PyPI trusted publishing is enabled
+		if target.Target == "python" && target.Publishing != nil && target.Publishing.PyPi != nil &&
+			target.Publishing.PyPi.UseTrustedPublishing != nil && *target.Publishing.PyPi.UseTrustedPublishing {
+			publishingFile.Jobs.PublishPypi = &config.PublishPyPiJob{
+				Needs:  []string{"publish"},
+				If:     "${{ needs.publish.outputs.python_regenerated == 'true' && needs.publish.outputs.publish_python == 'true' && needs.publish.outputs.use_pypi_trusted_publishing == 'true' }}",
+				RunsOn: "ubuntu-latest",
+				Steps: []config.PublishPyPiStep{
+					{
+						Uses: "actions/checkout@v4",
+					},
+					{
+						Uses: "speakeasy-api/sdk-generation-action/publish-pypi@v15",
+						With: map[string]any{
+							"python-directory":    "${{ needs.publish.outputs.python_directory }}",
+							"speakeasy_api_key":   formatGithubSecretName(defaultSpeakeasyAPIKeySecretName),
+							"github_access_token": formatGithubSecretName(defaultGithubTokenSecretName),
+						},
+					},
+				},
+			}
 		}
 
 		// Write a github publishing file.
@@ -456,6 +582,21 @@ func WriteGenerationFile(generationWorkflow *config.GenerateWorkflow, generation
 	}
 
 	if err := os.WriteFile(generationWorkflowFilePath, genWorkflowBuf.Bytes(), 0o644); err != nil {
+		return errors.Wrapf(err, "failed to write github workflow file")
+	}
+
+	return nil
+}
+
+func writeTestingFile(testingWorkflow *config.TestingWorkflow, testingWorkflowFilePath string) error {
+	var genWorkflowBuf bytes.Buffer
+	yamlEncoder := yaml.NewEncoder(&genWorkflowBuf)
+	yamlEncoder.SetIndent(2)
+	if err := yamlEncoder.Encode(testingWorkflow); err != nil {
+		return errors.Wrapf(err, "failed to encode workflow file")
+	}
+
+	if err := os.WriteFile(testingWorkflowFilePath, genWorkflowBuf.Bytes(), 0o644); err != nil {
 		return errors.Wrapf(err, "failed to write github workflow file")
 	}
 
@@ -517,6 +658,9 @@ func defaultGenerationFile() *config.GenerateWorkflow {
 					Cron: "0 0 * * *",
 				},
 			},
+			PullRequest: config.PullRequestOn{
+				Types: []string{"labeled", "unlabeled"},
+			},
 		},
 		Jobs: config.Jobs{
 			Generate: config.Job{
@@ -567,6 +711,56 @@ func defaultPublishingFile() *config.PublishWorkflow {
 	}
 }
 
+func defaultTestingFile(sdkName string, sdkOutputDir *string, workflowFileDir string, secrets map[string]string) *config.TestingWorkflow {
+	sdkPath := "**"
+	if sdkOutputDir != nil && *sdkOutputDir != "." && *sdkOutputDir != "./" {
+		sdkPath = fmt.Sprintf("%s/**", filepath.Join(workflowFileDir, strings.TrimPrefix(*sdkOutputDir, "/")))
+	}
+	testingAction := &config.TestingWorkflow{
+		Name: "Test",
+		Permissions: config.Permissions{
+			Checks:       config.GithubWritePermission,
+			Statuses:     config.GithubWritePermission,
+			Contents:     config.GithubWritePermission,
+			PullRequests: config.GithubWritePermission,
+			IDToken:      config.GithubWritePermission,
+		},
+		On: config.TestingOn{
+			PullRequest: config.Push{
+				Paths: []string{
+					sdkPath,
+				},
+				Branches: []string{
+					"main",
+				},
+			},
+			WorkflowDispatch: config.WorkflowDispatchTesting{
+				Inputs: config.InputsTesting{
+					Target: config.Target{
+						Description: "Provided SDK target to run tests for, (all) is valid",
+						Type:        "string",
+					},
+				},
+			},
+		},
+		Jobs: config.Jobs{
+			Test: config.Job{
+				Uses: "speakeasy-api/sdk-generation-action/.github/workflows/sdk-test.yaml@v15",
+				With: map[string]any{
+					"target": fmt.Sprintf("${{ github.event.inputs.target || '%s' }}", sdkName),
+				},
+				Secrets: secrets,
+			},
+		},
+	}
+
+	if workflowFileDir != "" {
+		testingAction.Jobs.Test.With["working_directory"] = workflowFileDir
+	}
+
+	return testingAction
+}
+
 func SelectPublishingTargets(publishingOptions []huh.Option[string], autoSelect bool) ([]string, error) {
 	chosenTargets := make([]string, 0)
 	if autoSelect {
@@ -580,6 +774,29 @@ func SelectPublishingTargets(publishingOptions []huh.Option[string], autoSelect 
 			Title("Select targets to configure publishing configs for.").
 			Description("Setup variables to configure publishing directly from Speakeasy.\n").
 			Options(publishingOptions...).
+			Value(&chosenTargets),
+	)), charm.WithKey("x/space", "toggle"))
+
+	if _, err := form.ExecuteForm(); err != nil {
+		return nil, err
+	}
+
+	return chosenTargets, nil
+}
+
+func SelectTestingTargets(testingOptions []huh.Option[string], autoSelect bool) ([]string, error) {
+	chosenTargets := make([]string, 0)
+	if autoSelect {
+		for _, option := range testingOptions {
+			chosenTargets = append(chosenTargets, option.Value)
+		}
+	}
+
+	form := charm.NewForm(huh.NewForm(huh.NewGroup(
+		huh.NewMultiSelect[string]().
+			Title("Select targets to configure sdk tests for.").
+			Description("Bootstrap tests for Speakeasy SDKs.\n").
+			Options(testingOptions...).
 			Value(&chosenTargets),
 	)), charm.WithKey("x/space", "toggle"))
 

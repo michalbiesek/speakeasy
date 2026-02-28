@@ -15,7 +15,6 @@ import (
 	"github.com/speakeasy-api/speakeasy/internal/env"
 
 	"github.com/speakeasy-api/speakeasy/internal/charm/styles"
-	"github.com/speakeasy-api/speakeasy/internal/config"
 	"github.com/speakeasy-api/speakeasy/internal/git"
 	"github.com/speakeasy-api/speakeasy/internal/interactivity"
 	"github.com/speakeasy-api/speakeasy/internal/log"
@@ -43,17 +42,37 @@ type QuickstartFlags struct {
 	Schema      string `json:"schema"`
 	OutDir      string `json:"out-dir"`
 	TargetType  string `json:"target"`
+	Output      string `json:"output"`
+
+	// If the quickstart should be based on a pre-existing template (hosted in the Speakeasy Registry)
+	From string `json:"from"`
+
+	// SDK name (e.g., "MyCompanySDK") - sets the SDK class name
+	Name string `json:"name"`
+
+	// Package name for the generated SDK (e.g., "my-company-sdk" for npm, module path for Go)
+	PackageName string `json:"package-name"`
+
+	// Whether to initialize a git repository in the output directory
+	InitGit bool `json:"init-git"`
+
+	// Hidden flag for bypassing interactive prompts
+	SkipInteractive bool `json:"skip-interactive"`
+
+	// Hidden flag for MCP TypeScript target
+	MCP bool `json:"mcp"`
 }
 
 //go:embed sample_openapi.yaml
 var sampleSpec string
 
 var quickstartCmd = &model.ExecutableCommand[QuickstartFlags]{
-	Usage:        "quickstart",
-	Short:        "Guided setup to help you create a new SDK in minutes.",
-	Long:         `Guided setup to help you create a new SDK in minutes.`,
-	Run:          quickstartExec,
-	RequiresAuth: true,
+	Usage:          "quickstart",
+	Short:          "Guided setup to help you create a new SDK in minutes.",
+	Long:           `Guided setup to help you create a new SDK in minutes.`,
+	Run:            quickstartNonInteractive,
+	RunInteractive: quickstartInteractive,
+	RequiresAuth:   true,
 	Flags: []flag.Flag{
 		flag.BooleanFlag{
 			Name:        "skip-compile",
@@ -62,7 +81,7 @@ var quickstartCmd = &model.ExecutableCommand[QuickstartFlags]{
 		flag.StringFlag{
 			Name:                       "schema",
 			Shorthand:                  "s",
-			Description:                "local filepath or URL for the OpenAPI schema",
+			Description:                "local filepath, URL, or registry reference for the OpenAPI schema (e.g., ./spec.yaml, https://..., namespace, org/workspace/namespace@tag)",
 			AutocompleteFileExtensions: charm.OpenAPIFileExtensions,
 		},
 		flag.StringFlag{
@@ -73,7 +92,44 @@ var quickstartCmd = &model.ExecutableCommand[QuickstartFlags]{
 		flag.StringFlag{
 			Name:        "target",
 			Shorthand:   "t",
-			Description: fmt.Sprintf("language to generate sdk for (available options: [%s])", strings.Join(prompts.GetSupportedTargets(), ", ")),
+			Description: fmt.Sprintf("generation target (available options: [%s])", strings.Join(prompts.GetSupportedTargetNames(), ", ")),
+		},
+		flag.StringFlag{
+			Name:        "from",
+			Shorthand:   "f",
+			Description: "template to use for the quickstart command.\nCreate a new sandbox at https://app.speakeasy.com/sandbox",
+		},
+		flag.EnumFlag{
+			Name:          "output",
+			Description:   "how to display output (available options: [summary, console, mermaid])",
+			DefaultValue:  "summary",
+			AllowedValues: []string{"summary", "console", "mermaid"},
+		},
+		flag.StringFlag{
+			Name:        "name",
+			Shorthand:   "n",
+			Description: "SDK name in PascalCase (e.g., \"MyCompanySDK\"). Users access SDK methods with myCompanySDK.DoThing()",
+		},
+		flag.StringFlag{
+			Name:        "package-name",
+			Shorthand:   "p",
+			Description: "package name for the generated SDK (e.g., \"my-company-sdk\" for npm, Go module path for Go)",
+		},
+		flag.BooleanFlag{
+			Name:        "init-git",
+			Description: "initialize a git repository in the output directory",
+		},
+		// Hidden flags for bypassing interactive prompts
+		flag.BooleanFlag{
+			Name:        "skip-interactive",
+			Description: "whether to use defaults - this will skip all prompts",
+			Hidden:      true,
+		},
+		// Hidden flag for MCP TypeScript target
+		flag.BooleanFlag{
+			Name:        "mcp",
+			Description: "preselect the mcp-typescript target",
+			Hidden:      true,
 		},
 	},
 }
@@ -83,7 +139,17 @@ const ErrWorkflowExists = speakeasyErrors.Error("You cannot run quickstart when 
 	"To add an additional SDK to this workflow: `speakeasy configure`. \n" +
 	"To regenerate the current workflow: `speakeasy run --watch`.")
 
-func quickstartExec(ctx context.Context, flags QuickstartFlags) error {
+func quickstartNonInteractive(ctx context.Context, flags QuickstartFlags) error {
+	flags.SkipInteractive = true
+	return quickstartCore(ctx, flags)
+}
+
+func quickstartInteractive(ctx context.Context, flags QuickstartFlags) error {
+	// Don't override SkipInteractive if the user explicitly set it via --skip-interactive flag
+	return quickstartCore(ctx, flags)
+}
+
+func quickstartCore(ctx context.Context, flags QuickstartFlags) error {
 	workingDir, err := os.Getwd()
 	if err != nil {
 		return err
@@ -97,8 +163,6 @@ func quickstartExec(ctx context.Context, flags QuickstartFlags) error {
 		return ErrWorkflowExists
 	}
 
-	log.From(ctx).PrintfStyled(styles.DimmedItalic, "\nYour first SDK is a few short questions away...\n")
-
 	quickstartObj := prompts.Quickstart{
 		WorkflowFile: &workflow.Workflow{
 			Version: workflow.WorkflowVersion,
@@ -106,6 +170,7 @@ func quickstartExec(ctx context.Context, flags QuickstartFlags) error {
 			Targets: make(map[string]workflow.Target),
 		},
 		LanguageConfigs: make(map[string]*sdkGenConfig.Configuration),
+		SkipInteractive: flags.SkipInteractive,
 	}
 
 	if flags.Schema != "" {
@@ -115,6 +180,28 @@ func quickstartExec(ctx context.Context, flags QuickstartFlags) error {
 	if flags.TargetType != "" {
 		quickstartObj.Defaults.TargetType = &flags.TargetType
 	}
+
+	// Handle the hidden --mcp flag
+	if flags.MCP {
+		mcpTarget := "mcp-typescript"
+		quickstartObj.Defaults.TargetType = &mcpTarget
+	}
+
+	if flags.From != "" {
+		quickstartObj.Defaults.Template = &flags.From
+		quickstartObj.IsUsingTemplate = true
+	}
+
+	if flags.Name != "" {
+		quickstartObj.Defaults.SDKName = &flags.Name
+	}
+
+	if flags.PackageName != "" {
+		quickstartObj.Defaults.PackageName = &flags.PackageName
+	}
+
+	// Always set InitGit since it has a default value
+	quickstartObj.Defaults.InitGit = &flags.InitGit
 
 	nextState := prompts.SourceBase
 	for nextState != prompts.Complete {
@@ -126,7 +213,7 @@ func quickstartExec(ctx context.Context, flags QuickstartFlags) error {
 		nextState = *state
 	}
 
-	if err := quickstartObj.WorkflowFile.Validate(generate.GetSupportedLanguages()); err != nil {
+	if err := quickstartObj.WorkflowFile.Validate(generate.GetSupportedTargetNames()); err != nil {
 		return errors.Wrapf(err, "failed to validate workflow file")
 	}
 
@@ -160,12 +247,19 @@ func quickstartExec(ctx context.Context, flags QuickstartFlags) error {
 		promptedDir = outDir
 	}
 	description := "We recommend a git repo per SDK. To use the current directory, leave empty."
-	if targetType == "terraform" {
+	switch targetType {
+	case "terraform":
 		description = "Terraform providers must be placed in a directory named in the following format terraform-provider-*. according to Hashicorp conventions"
-		outDir = "terraform-provider"
+	case "mcp-typescript":
+		description = "We recommend a git repo for each MCP Server. To use the current directory, leave empty."
 	}
 
-	if !currentDirectoryEmpty() {
+	// Skip the output directory prompt if:
+	// - The current directory is empty, OR
+	// - Running in non-interactive mode (SkipInteractive), OR
+	// - The --out-dir flag was explicitly provided
+	outDirProvided := flags.OutDir != ""
+	if !currentDirectoryEmpty() && !quickstartObj.SkipInteractive && !outDirProvided {
 		_, err = charm.NewForm(huh.NewForm(huh.NewGroup(charm.NewInput(&promptedDir).
 			Title("What directory should the "+targetType+" files be written to?").
 			Description(description+"\n").
@@ -173,15 +267,15 @@ func quickstartExec(ctx context.Context, flags QuickstartFlags) error {
 			SetSuggestionCallback(charm.SuggestionCallback(charm.SuggestionCallbackConfig{IsDirectories: true})).
 			Validate(func(s string) error {
 				if targetType == "terraform" {
-					if !strings.HasPrefix(s, "terraform-provider") && !strings.HasPrefix(filepath.Base(filepath.Join(workingDir, s)), "terraform-provider") {
-						return errors.New("a terraform provider directory must start with 'terraform-provider'")
+					if !strings.HasPrefix(s, "terraform-provider-") && !strings.HasPrefix(filepath.Base(filepath.Join(workingDir, s)), "terraform-provider-") {
+						return errors.New("a terraform provider directory must start with 'terraform-provider-'")
 					}
 				}
 				return nil
 			}))),
 			charm.WithTitle("Pick an output directory for your newly created files.")).
 			ExecuteForm()
-	} else {
+	} else if !outDirProvided {
 		promptedDir = "."
 	}
 
@@ -211,15 +305,7 @@ func quickstartExec(ctx context.Context, flags QuickstartFlags) error {
 		DetectDotGit: true,
 	})
 	if errors.Is(err, gitc.ErrRepositoryNotExists) {
-		initialiseRepo = true
-		prompt := charm.NewBranchPrompt(
-			"Do you want to initialize a new git repository?",
-			"Selecting 'Yes' will initialize a new git repository in the output directory",
-			&initialiseRepo,
-		)
-		if _, err := charm.NewForm(huh.NewForm(prompt)).ExecuteForm(); err != nil {
-			initialiseRepo = false
-		}
+		initialiseRepo = shouldInitGit(&quickstartObj)
 	}
 
 	var resolvedSchema string
@@ -258,6 +344,27 @@ func quickstartExec(ctx context.Context, flags QuickstartFlags) error {
 		quickstartObj.WorkflowFile.Sources[sourceName].Inputs[0].Location = workflow.LocationString(referencePath)
 	}
 
+	// If we are using a blueprint template, the original location will be a
+	// tempfile. We want therefore to move the tempfile to the output directory,
+	// and update the workflow file to point to the new location.
+	if quickstartObj.IsUsingTemplate {
+		oldInput := quickstartObj.WorkflowFile.Sources[sourceName].Inputs[0].Location
+
+		oldInputPath := oldInput.Resolve()
+		// parse the last part of the path to get the filename + extension
+		filename := filepath.Base(oldInputPath)
+
+		ext := filepath.Ext(filename)
+
+		newPath := filepath.Join(outDir, fmt.Sprintf("openapi%s", ext))
+
+		if err := os.Rename(oldInputPath, newPath); err != nil {
+			return errors.Wrapf(err, "failed to rename blueprint to openapi.yaml")
+		}
+
+		quickstartObj.WorkflowFile.Sources[sourceName].Inputs[0].Location = workflow.LocationString(newPath)
+	}
+
 	// Make sure the workflow file stays up to date
 	run.Migrate(ctx, quickstartObj.WorkflowFile)
 
@@ -287,6 +394,7 @@ func quickstartExec(ctx context.Context, flags QuickstartFlags) error {
 		run.WithTarget(initialTarget),
 		run.WithShouldCompile(!flags.SkipCompile),
 		run.WithSkipCleanup(), // The studio won't work if we clean up before it launches
+		run.WithAllowPrompts(flags.Output == "summary" || flags.Output == ""),
 	)
 
 	defer func() {
@@ -308,9 +416,49 @@ func quickstartExec(ctx context.Context, flags QuickstartFlags) error {
 		changeDirMsg = fmt.Sprintf("`cd %s` before moving forward with your SDK", relPath)
 	}
 
-	if err = wf.RunWithVisualization(ctx); err != nil {
+	// Initialize git repository BEFORE running workflow so that generation can detect it
+	// for the persistent edits / custom code feature
+	if initialiseRepo {
+		_, err = git.InitLocalRepository(outDir)
+		switch {
+		case err != nil && !errors.Is(err, gitc.ErrRepositoryAlreadyExists):
+			log.From(ctx).Warnf("Encountered issue initializing git repository: %s", err.Error())
+		case err == nil:
+			log.From(ctx).Infof("Initialized new git repository at %s", outDir)
+		default: // If the error is ErrRepositoryAlreadyExists, ignore it
+			err = nil
+		}
+	}
+
+	// Offer to install agent skills before generation (interactive only)
+	if !quickstartObj.SkipInteractive {
+		offerSkillInstall(ctx, outDir)
+	}
+
+	// Execute the workflow based on output mode
+	switch flags.Output {
+	case "summary":
+		err = wf.RunWithVisualization(ctx)
+	case "mermaid":
+		err = wf.Run(ctx)
+		if err == nil {
+			wf.RootStep.Finalize(true)
+			if mermaid, mermaidErr := wf.RootStep.ToMermaidDiagram(); mermaidErr == nil {
+				log.From(ctx).Println("\n" + styles.MakeSection("Mermaid diagram of workflow", mermaid, styles.Colors.Blue))
+			}
+		}
+	case "console":
+		err = wf.Run(ctx)
+		if err == nil {
+			wf.RootStep.Finalize(true)
+		}
+	default:
+		err = wf.RunWithVisualization(ctx)
+	}
+
+	if err != nil {
 		if strings.Contains(err.Error(), "document invalid") {
-			if retry, newErr := retryWithSampleSpec(ctx, quickstartObj.WorkflowFile, initialTarget, outDir, flags.SkipCompile); newErr != nil {
+			if retry, newErr := retryWithSampleSpec(ctx, quickstartObj.WorkflowFile, initialTarget, outDir, flags.SkipCompile, flags.Output); newErr != nil {
 				return errors.Wrapf(err, "failed to run generation workflow")
 			} else if retry {
 				if changeDirMsg != "" {
@@ -327,36 +475,27 @@ func quickstartExec(ctx context.Context, flags QuickstartFlags) error {
 	// Print a message and save the workflow if there were MVS removals
 	handleMVSChanges(ctx, wf.GetWorkflowFile(), outDir)
 
-	if initialiseRepo {
-		_, err = git.InitLocalRepository(outDir)
-		if err != nil && !errors.Is(err, gitc.ErrRepositoryAlreadyExists) {
-			log.From(ctx).Warnf("Encountered issue initializing git repository: %s", err.Error())
-		} else if err == nil {
-			log.From(ctx).Infof("Initialized new git repository at %s", outDir)
-		} else { // If the error is ErrRepositoryAlreadyExists, ignore it
-			err = nil
-		}
-	}
-
 	if changeDirMsg != "" {
 		logger.Println(styles.RenderWarningMessage("! ATTENTION DO THIS !", changeDirMsg))
 	}
 
 	// Flush event before launching studio so that we don't wait until the studio is closed to send telemetry
 	// Doing it before shouldLaunchStudio because that blocks asking the user for input
-	events.FlushActiveEvent(ctx, err)
+	_ = events.FlushActiveEvent(ctx, err)
 
-	if shouldLaunchStudio(ctx, wf, true) {
+	shouldLaunch := shouldLaunchStudio(ctx, wf, &quickstartObj)
+
+	if shouldLaunch {
 		err = studio.LaunchStudio(ctx, wf)
-	} else if len(wf.SDKOverviewURLs) == 1 { // There should only be one target after quickstart
+	} else if len(wf.SDKOverviewURLs) == 1 && !quickstartObj.SkipInteractive { // There should only be one target after quickstart
 		overviewURL := wf.SDKOverviewURLs[initialTarget]
-		utils.OpenInBrowser(overviewURL)
+		_ = utils.OpenInBrowser(overviewURL)
 	}
 
 	return err
 }
 
-func retryWithSampleSpec(ctx context.Context, workflowFile *workflow.Workflow, initialTarget, outDir string, skipCompile bool) (bool, error) {
+func retryWithSampleSpec(ctx context.Context, workflowFile *workflow.Workflow, initialTarget, outDir string, skipCompile bool, output string) (bool, error) {
 	retrySampleSpec := true
 	_, err := charm.NewForm(huh.NewForm(
 		huh.NewGroup(
@@ -393,33 +532,53 @@ func retryWithSampleSpec(ctx context.Context, workflowFile *workflow.Workflow, i
 		ctx,
 		run.WithTarget(initialTarget),
 		run.WithShouldCompile(!skipCompile),
+		run.WithAllowPrompts(output == "summary" || output == ""),
 	)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse workflow: %w", err)
+	}
 
-	err = wf.RunWithVisualization(ctx)
+	// Execute the workflow based on output mode
+	switch output {
+	case "summary":
+		err = wf.RunWithVisualization(ctx)
+	case "mermaid":
+		err = wf.Run(ctx)
+		if err == nil {
+			wf.RootStep.Finalize(true)
+			if mermaid, mermaidErr := wf.RootStep.ToMermaidDiagram(); mermaidErr == nil {
+				log.From(ctx).Println("\n" + styles.MakeSection("Mermaid diagram of workflow", mermaid, styles.Colors.Blue))
+			}
+		}
+	case "console":
+		err = wf.Run(ctx)
+		if err == nil {
+			wf.RootStep.Finalize(true)
+		}
+	default:
+		err = wf.RunWithVisualization(ctx)
+	}
 
 	return true, err
 }
 
-func shouldLaunchStudio(ctx context.Context, wf *run.Workflow, fromQuickstart bool) bool {
-	if !studio.CanLaunch(ctx, wf) {
+func shouldLaunchStudio(ctx context.Context, wf *run.Workflow, quickstart *prompts.Quickstart) bool {
+	if quickstart != nil && quickstart.SkipInteractive {
 		return false
 	}
 
-	offerDeclineOption := !fromQuickstart && config.SeenStudio()
+	if !studio.CanLaunch(ctx, wf) {
+		return false
+	}
 
 	numDiagnostics := wf.CountDiagnostics()
 	if numDiagnostics == 0 {
 		return false
 	}
 
-	if offerDeclineOption {
-		message := fmt.Sprintf("We've detected %d potential improvements for your SDK. Would you like to launch the studio?", numDiagnostics)
-		return interactivity.SimpleConfirm(message, true)
-	}
-
-	message := fmt.Sprintf("\nWe've detected %d potential improvements for your SDK. The Speakeasy Studio can help you fix them.\n", numDiagnostics)
-	log.From(ctx).PrintfStyled(styles.HeavilyEmphasized, message)
-	return interactivity.SimpleButton("↵ Launch Studio", "Press enter to continue")
+	message := fmt.Sprintf("\nWe've detected %d potential improvements for your SDK. Speakeasy Studio can help you fix them.\n", numDiagnostics)
+	log.From(ctx).PrintStyled(styles.HeavilyEmphasized, message)
+	return interactivity.SimpleConfirm("Would you like to launch Speakeasy Studio?", true)
 }
 
 func printSampleSpecMessage(absSchemaPath string) {
@@ -473,10 +632,37 @@ func setDefaultOutDir(workingDir string, sdkClassName string, targetType string)
 			return "."
 		}
 
-		subDirectory = fmt.Sprintf("terraform-provider-%s", subDirectory)
+		subDirectory = fmt.Sprintf("terraform-provider-%s", strcase.ToKebab(sdkClassName))
 	}
 
 	return filepath.Join(workingDir, subDirectory)
+}
+
+func shouldInitGit(quickstart *prompts.Quickstart) bool {
+	// Check if --init-git flag was explicitly set
+	initGitExplicit := quickstart.Defaults.InitGit != nil && *quickstart.Defaults.InitGit
+
+	// If --init-git flag is present, init git without prompting
+	if initGitExplicit {
+		return true
+	}
+
+	// In non-interactive mode without --init-git flag, don't init git
+	if quickstart.SkipInteractive {
+		return false
+	}
+
+	// In interactive mode without --init-git flag, prompt the user
+	initRepo := true
+	prompt := charm.NewBranchPrompt(
+		"Do you want to initialize a new git repository?",
+		"Selecting 'Yes' will initialize a new git repository in the output directory",
+		&initRepo,
+	)
+	if _, err := charm.NewForm(huh.NewForm(prompt)).ExecuteForm(); err != nil {
+		return false
+	}
+	return initRepo
 }
 
 func currentDirectoryEmpty() bool {
@@ -488,5 +674,32 @@ func currentDirectoryEmpty() bool {
 	defer dir.Close()
 
 	_, err = dir.Readdirnames(1)
-	return err == io.EOF
+	return errors.Is(err, io.EOF)
+}
+
+// offerSkillInstall runs the full interactive skill setup flow (agent selection,
+// skill selection) at the git repo root.
+func offerSkillInstall(ctx context.Context, outDir string) {
+	// Find the git repo root — skills belong at the repo level, not the SDK output dir
+	repo, err := gitc.PlainOpenWithOptions(outDir, &gitc.PlainOpenOptions{DetectDotGit: true})
+	if err != nil {
+		return // not in a git repo, skip silently
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		return
+	}
+	repoRoot := wt.Filesystem.Root()
+
+	// runSetupSkillsInteractive uses os.Getwd() as project dir, so temporarily
+	// chdir to repo root for the install, then restore.
+	if err := os.Chdir(repoRoot); err != nil {
+		return
+	}
+	defer os.Chdir(outDir) //nolint:errcheck
+
+	// Reuse the full interactive setup-skills flow (same as install.sh)
+	if err := runSetupSkillsInteractive(ctx, AgentSetupSkillsFlags{}); err != nil {
+		log.From(ctx).Warnf("Failed to install agent skills: %s", err.Error())
+	}
 }

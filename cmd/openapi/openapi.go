@@ -3,9 +3,10 @@ package openapi
 import (
 	"context"
 	"fmt"
-	"github.com/speakeasy-api/speakeasy/cmd/lint"
 	"os"
 	"strings"
+
+	"github.com/speakeasy-api/speakeasy/cmd/lint"
 
 	"github.com/pb33f/openapi-changes/tui"
 	"github.com/pkg/errors"
@@ -22,12 +23,14 @@ import (
 
 const openapiLong = "# OpenAPI \n The `openapi` command provides a set of commands for visualizing, linting and transforming OpenAPI documents."
 
+var outputTypes = []string{"summary", "console", "html"}
+
 var OpenAPICmd = &model.CommandGroup{
 	Usage:          "openapi",
 	Short:          "Utilities for working with OpenAPI documents",
 	Long:           utils.RenderMarkdown(openapiLong),
 	InteractiveMsg: "What do you want to do?",
-	Commands:       []model.Command{openapiLintCmd, openapiDiffCmd, transformCmd},
+	Commands:       []model.Command{openapiLintCmd, openapiDiffCmd, transformCmd, snipCmd},
 }
 
 var openapiLintCmd = &model.ExecutableCommand[lint.LintOpenapiFlags]{
@@ -47,10 +50,17 @@ type OpenAPIDiffFlags struct {
 	Output    string `json:"output"`
 }
 
+const openapiDiffLong = `Visualize the **raw OpenAPI schema changes** between two documents - paths added/removed,
+operations changed, properties modified, etc.
+
+This is different from ` + "`speakeasy diff`" + ` which shows SDK-level changes (how generated
+SDK methods and types would differ). Use this command when you want to see the raw
+specification differences.`
+
 var openapiDiffCmd = model.ExecutableCommand[OpenAPIDiffFlags]{
 	Usage:          "diff",
 	Short:          "Visualize the changes between two OpenAPI documents",
-	Long:           `Visualize the changes between two OpenAPI documents`,
+	Long:           openapiDiffLong,
 	Run:            diffOpenapi,
 	RunInteractive: diffOpenapiInteractive,
 	Flags: []flag.Flag{
@@ -75,8 +85,8 @@ var openapiDiffCmd = model.ExecutableCommand[OpenAPIDiffFlags]{
 		flag.EnumFlag{
 			Name:          "format",
 			Shorthand:     "f",
-			Description:   "output format",
-			AllowedValues: []string{"summary", "console", "html"},
+			Description:   fmt.Sprintf("output format (available options: %s)", outputTypes),
+			AllowedValues: outputTypes,
 			DefaultValue:  "summary",
 		},
 	},
@@ -139,7 +149,7 @@ func diffOpenapiInteractive(ctx context.Context, flags OpenAPIDiffFlags) error {
 
 	if hasRegistryBundle {
 		// CleanupPaths temp dir if we had used a registry bundle
-		defer os.RemoveAll(workflow.GetTempDir())
+		defer func() { _ = os.RemoveAll(workflow.GetTempDir()) }()
 	}
 
 	changes, err := changes.GetChanges(ctx, oldSchema, newSchema)

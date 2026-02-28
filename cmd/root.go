@@ -7,9 +7,12 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/speakeasy-api/speakeasy/cmd/ci"
 	"github.com/speakeasy-api/speakeasy/cmd/lint"
+	"github.com/speakeasy-api/speakeasy/cmd/patches"
 
 	"github.com/speakeasy-api/speakeasy/cmd/generate"
+	"github.com/speakeasy-api/speakeasy/cmd/mcp"
 	"github.com/speakeasy-api/speakeasy/cmd/openapi"
 
 	"github.com/speakeasy-api/speakeasy-core/events"
@@ -28,9 +31,11 @@ import (
 	"go.uber.org/zap"
 )
 
-const rootLong = `# Speakeasy 
+const rootLong = `# Speakeasy
 
 A CLI tool for interacting with the [Speakeasy platform](https://www.speakeasy.com/) and its APIs.
+
+AI Agents: run **speakeasy agent context** for structured documentation and project guidance.
 
 Use this CLI to:
 - Lint and validate OpenAPI specs
@@ -39,9 +44,10 @@ Use this CLI to:
 - Suggest improvements to OpenAPI specs
 
 Generate from OpenAPI Specs:
-- Client and Server SDKs in GO, Python, TypeScript, Java, PHP, C#, Swift, Ruby
+- Client and Server SDKs in GO, Python, TypeScript, Java, PHP, C#, Ruby
 - Postman collections
 - Terraform providers
+- MCP Servers
 
 [Quickstart guide](https://www.speakeasy.com/docs/create-client-sdks)
 
@@ -70,6 +76,7 @@ func Init(version, artifactArch string) {
 	rootCmd.PersistentFlags().String("logLevel", string(log.LevelInfo), fmt.Sprintf("the log level (available options: [%s])", strings.Join(log.Levels, ", ")))
 
 	// TODO: migrate this file to use model.CommandGroup once all subcommands have been refactored
+	addCommand(rootCmd, agentCmd)
 	addCommand(rootCmd, statusCmd)
 	addCommand(rootCmd, quickstartCmd)
 	addCommand(rootCmd, billingCmd)
@@ -77,6 +84,7 @@ func Init(version, artifactArch string) {
 	addCommand(rootCmd, configureCmd)
 	addCommand(rootCmd, generate.GenerateCmd)
 	addCommand(rootCmd, lint.LintCmd)
+	addCommand(rootCmd, mcp.MCPCmd)
 	addCommand(rootCmd, openapi.OpenAPICmd)
 	addCommand(rootCmd, migrateCmd)
 
@@ -87,13 +95,18 @@ func Init(version, artifactArch string) {
 	addCommand(rootCmd, testCmd)
 	addCommand(rootCmd, defaultCodeSamplesCmd)
 	updateInit(version, artifactArch)
-	proxyInit()
 	languageServerInit(version)
 	bumpInit()
 	addCommand(rootCmd, tagCmd)
 	addCommand(rootCmd, cleanCmd)
 
 	addCommand(rootCmd, AskCmd)
+	addCommand(rootCmd, reproCmd)
+	addCommand(rootCmd, diffCmd)
+	addCommand(rootCmd, orphanedFilesCmd)
+	addCommand(rootCmd, patches.PatchesCmd)
+	addCommand(rootCmd, ci.CICmd)
+	pullInit()
 }
 
 func addCommand(cmd *cobra.Command, command model.Command) {
@@ -121,6 +134,7 @@ func Execute(version, artifactArch string) {
 }
 
 func setupRootCmd(version, artifactArch string) {
+	env.SetSpeakeasyVersion(version)
 	rootCmd.Version = version + "\n" + artifactArch
 	rootCmd.SilenceErrors = true
 	rootCmd.SilenceUsage = true
@@ -158,6 +172,13 @@ func checkForUpdate(ctx context.Context, currentVersion, artifactArch string, cm
 		return
 	}
 
+	wf, _, _ := utils.GetWorkflow()
+
+	// If we are running the run command and a workflow file is present and specifies that the speakeasyVersion is "latest", don't display update notifications as it will be automatically updated when the command is run.
+	if cmd.Name() == "run" && wf != nil && wf.SpeakeasyVersion.String() == "latest" {
+		return
+	}
+
 	newerVersion, err := updates.GetNewerVersion(ctx, artifactArch, currentVersion)
 	if err != nil {
 		return // Don't display error to user
@@ -176,8 +197,6 @@ func checkForUpdate(ctx context.Context, currentVersion, artifactArch string, cm
 	l := log.From(ctx)
 	l.PrintfStyled(mainStyle.Padding(1, 2), "%s\n%s", versionString, updateString)
 	l.Println("\n")
-
-	return
 }
 
 func setLogLevel(cmd *cobra.Command) error {

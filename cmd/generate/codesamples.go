@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/AlekSi/pointer"
+	"github.com/speakeasy-api/openapi/pointer"
 	"github.com/speakeasy-api/sdk-gen-config/workflow"
 	"github.com/speakeasy-api/speakeasy/pkg/codesamples"
 
@@ -65,10 +65,9 @@ var codeSamplesCmd = &model.ExecutableCommand[codeSamplesFlags]{
 
 func runCodeSamples(ctx context.Context, flags codeSamplesFlags) error {
 	var opts workflow.CodeSamples
-	switch flags.Style {
-	case "readme":
-		opts.Style = pointer.ToString("readme")
-		//Nothing to do in default case, rely on code samples default
+	if flags.Style == "readme" {
+		opts.Style = pointer.From("readme")
+		// Nothing to do in default case, rely on code samples default
 	}
 
 	result, err := codesamples.GenerateOverlay(ctx, flags.Schema, flags.Header, flags.Token, flags.ConfigPath, flags.Out, flags.Langs, false, false, opts)

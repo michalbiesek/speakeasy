@@ -2,6 +2,7 @@
 
 package components
 
+// SuggestResponse - Successful response
 type SuggestResponse struct {
 	// The studio modifications overlay contents - this should be an overlay YAML document
 	Overlay string `json:"overlay"`

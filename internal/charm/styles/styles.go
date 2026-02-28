@@ -168,7 +168,7 @@ func MakeSection(title, content string, color lipgloss.AdaptiveColor) string {
 func MakeBreak(heading string, character rune, color lipgloss.AdaptiveColor, isStart bool) string {
 	termWidth := TerminalWidth()
 
-	line := ""
+	var line string
 	if heading == "" {
 		line = strings.Repeat(string(character), termWidth)
 	} else {
@@ -200,4 +200,12 @@ func RenderSupportEmail() string {
 	}
 
 	return Emphasized.Render("support@speakeasy.com")
+}
+
+func RenderSalesEmail() string {
+	if env.IsGithubAction() {
+		return "sales@speakeasy.com"
+	}
+
+	return Emphasized.Render("sales@speakeasy.com")
 }

@@ -12,17 +12,21 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/speakeasy-api/huh"
+	"github.com/speakeasy-api/speakeasy-client-sdk-go/v3/pkg/models/operations"
+	"github.com/speakeasy-api/speakeasy-client-sdk-go/v3/pkg/models/shared"
 	"github.com/speakeasy-api/speakeasy-core/openapi"
 
 	timeAgo "github.com/dustin/go-humanize"
 	humanize "github.com/dustin/go-humanize/english"
 	"github.com/speakeasy-api/speakeasy/internal/charm/styles"
 	"github.com/speakeasy-api/speakeasy/internal/remote"
+	"github.com/speakeasy-api/speakeasy/internal/sdk"
 
 	"github.com/iancoleman/strcase"
 	"github.com/pkg/errors"
 	"github.com/speakeasy-api/sdk-gen-config/workflow"
 	"github.com/speakeasy-api/speakeasy-core/auth"
+
 	charm_internal "github.com/speakeasy-api/speakeasy/internal/charm"
 	"github.com/speakeasy-api/speakeasy/registry"
 )
@@ -131,26 +135,33 @@ func getRemoteAuthenticationPrompts(fileLocation, authHeader *string) []*huh.Gro
 	}
 }
 
-func getSDKName(sdkName *string, placeholder string) error {
-	if sdkName == nil || *sdkName == "" {
-		descriptionFn := func() string {
-			v := placeholder
-			if sdkName != nil && *sdkName != "" {
-				v = *sdkName
-			}
-			return "Your users will access your SDK using " + styles.Emphasized.Render(fmt.Sprintf("%s.DoThing()\n", v))
-		}
-
-		return charm_internal.Execute(
-			charm_internal.NewInput(sdkName).
-				Title("Give your SDK a name").
-				DescriptionFunc(descriptionFn, sdkName).
-				Placeholder(placeholder).
-				Suggestions([]string{placeholder}),
-		)
+func getSDKName(quickstart *Quickstart, placeholder string) error {
+	// If SDK name was provided via --name flag, use it directly
+	if quickstart.Defaults.SDKName != nil && *quickstart.Defaults.SDKName != "" {
+		quickstart.SDKName = *quickstart.Defaults.SDKName
+		return nil
 	}
 
-	return nil
+	if quickstart.SkipInteractive {
+		quickstart.SDKName = placeholder
+		return nil
+	}
+
+	descriptionFn := func() string {
+		v := placeholder
+		if quickstart.SDKName != "" {
+			v = quickstart.SDKName
+		}
+		return "Your users will access your SDK using " + styles.Emphasized.Render(fmt.Sprintf("%s.DoThing()\n", v))
+	}
+
+	return charm_internal.Execute(
+		charm_internal.NewInput(&quickstart.SDKName).
+			Title("Give your SDK a name").
+			DescriptionFunc(descriptionFn, &quickstart.SDKName).
+			Placeholder(placeholder).
+			Suggestions([]string{placeholder}),
+	)
 }
 
 func getOverlayPrompts(promptForOverlay *bool, overlayLocation, authHeader *string) []*huh.Group {
@@ -180,14 +191,18 @@ func sourceBaseForm(ctx context.Context, quickstart *Quickstart) (*QuickstartSta
 	defer cancel()
 	recentGenerations, err := remote.GetRecentWorkspaceGenerations(timeout)
 
+	hasTemplate := quickstart.Defaults.Template != nil && *quickstart.Defaults.Template != ""
+	hasSchemaPath := quickstart.Defaults.SchemaPath != nil && *quickstart.Defaults.SchemaPath != ""
+
 	// Retrieve recent namespaces and check if there are any available.
-	hasRecentGenerations := err == nil && len(recentGenerations) > 0
+	// If --from or --schema is provided, we will not check for recent generations.
+	hasRecentGenerations := !hasTemplate && !hasSchemaPath && err == nil && len(recentGenerations) > 0
 
 	// Determine if we should use a remote source. Defaults to true before the user
 	// has interacted with the form.
 	useRemoteSource := hasRecentGenerations
 
-	if hasRecentGenerations {
+	if hasRecentGenerations && !quickstart.SkipInteractive {
 		prompt := charm_internal.NewBranchPrompt(
 			"Do you want to base your SDK on an existing SDK?",
 			"Selecting 'Yes' will allow you to pick from the most recently used SDKs in your workspace",
@@ -201,7 +216,6 @@ func sourceBaseForm(ctx context.Context, quickstart *Quickstart) (*QuickstartSta
 	selectedRegistryUri := ""
 	if useRemoteSource {
 		selectedRecentGeneration, err := selectRecentGeneration(ctx, recentGenerations)
-
 		if err != nil {
 			useRemoteSource = false
 		}
@@ -213,14 +227,52 @@ func sourceBaseForm(ctx context.Context, quickstart *Quickstart) (*QuickstartSta
 		}
 	}
 
-	if quickstart.Defaults.SchemaPath != nil {
-		fileLocation = *quickstart.Defaults.SchemaPath
-	} else if useRemoteSource && selectedRegistryUri != "" {
+	var templateFile *shared.SchemaStoreItem
+
+	if hasTemplate {
+		templateFile, err = fetchTemplate(ctx, *quickstart.Defaults.Template)
+		if err == nil {
+			fileLocation, err = saveTemplateToDisk(ctx, templateFile)
+			if err != nil {
+				return nil, err
+			}
+
+			quickstart.SDKName = templateFile.SDKClassname
+
+			fmt.Println(
+				styles.RenderInfoMessage(
+					fmt.Sprintf("Using template '%s'", *quickstart.Defaults.Template),
+				) + "\n",
+			)
+		} else {
+			// fallthrough
+			fmt.Println(
+				styles.RenderInfoMessage(
+					fmt.Sprintf("Could not find template '%s'. Continuing with quickstart...", *quickstart.Defaults.Template),
+				) + "\n",
+			)
+		}
+	}
+
+	// Get org/workspace from auth context for registry shorthand expansion
+	orgSlug := auth.GetOrgSlugFromContext(ctx)
+	workspaceSlug := auth.GetWorkspaceSlugFromContext(ctx)
+
+	switch {
+	case hasTemplate && fileLocation != "":
+		quickstart.Defaults.TemplateData = templateFile
+	case quickstart.Defaults.SchemaPath != nil:
+		// Expand registry shorthand if applicable (e.g., "namespace" or "org/workspace/namespace@tag")
+		// For local files and URLs, this returns the input unchanged
+		fileLocation = expandRegistryShorthand(*quickstart.Defaults.SchemaPath, orgSlug, workspaceSlug)
+	case useRemoteSource && selectedRegistryUri != "":
 		// The workflow file will be updated with a registry based input like:
 		// inputs:
 		// - location: registry.speakeasyapi.dev/speakeasy-self/speakeasy-self/petstore-oas@latest
 		fileLocation = selectedRegistryUri
-	} else {
+	case quickstart.SkipInteractive:
+		fileLocation = ""
+	default:
 		if err := getOASLocation(&fileLocation, &authHeader, true); err != nil {
 			return nil, err
 		}
@@ -234,21 +286,21 @@ func sourceBaseForm(ctx context.Context, quickstart *Quickstart) (*QuickstartSta
 		}
 	}
 
-	orgSlug := auth.GetOrgSlugFromContext(ctx)
 	isUsingSampleSpec := strings.TrimSpace(fileLocation) == ""
-	if isUsingSampleSpec {
+	switch {
+	case isUsingSampleSpec:
 		configureSampleSpec(quickstart, &fileLocation, &sourceName)
-	} else if selectedRemoteNamespace != "" {
+	case selectedRemoteNamespace != "":
 		sourceName = selectedRemoteNamespace
-	} else {
-		// No need to prompt for SDK name if we are using a sample spec
-		if err := getSDKName(&quickstart.SDKName, strcase.ToCamel(orgSlug)); err != nil {
+	default:
+		if err := getSDKName(quickstart, strcase.ToCamel(orgSlug)); err != nil {
 			return nil, err
 		}
-		if summary != nil {
-			sourceName = summary.Info.Title
+
+		if summary != nil && summary.Info.Title != "" {
+			sourceName = strings.ReplaceAll(summary.Info.Title, "/", "-")
 		} else {
-			sourceName = quickstart.SDKName + "-OAS"
+			sourceName = strings.ReplaceAll(quickstart.SDKName, "/", "-") + "-OAS"
 		}
 	}
 
@@ -257,6 +309,12 @@ func sourceBaseForm(ctx context.Context, quickstart *Quickstart) (*QuickstartSta
 		return nil, err
 	}
 	source.Inputs = append(source.Inputs, *document)
+
+	if authHeader == "" && (source.Output == nil || *source.Output == "") {
+		// Set default output path for source
+		defaultOutput := ".speakeasy/out.openapi.yaml"
+		source.Output = &defaultOutput
+	}
 
 	if registry.IsRegistryEnabled(ctx) && orgSlug != "" && auth.GetWorkspaceSlugFromContext(ctx) != "" {
 		if err := configureRegistry(source, orgSlug, auth.GetWorkspaceSlugFromContext(ctx), sourceName); err != nil {
@@ -594,7 +652,7 @@ var (
 
 // selectRecentGeneration handles the user interaction for selecting a namespace/recent generation
 // which will be used as the template for the new target.
-func selectRecentGeneration(ctx context.Context, generations []remote.RecentGeneration) (*remote.RecentGeneration, error) {
+func selectRecentGeneration(_ context.Context, generations []remote.RecentGeneration) (*remote.RecentGeneration, error) {
 	opts := make([]huh.Option[string], len(generations))
 
 	for i, generation := range generations {
@@ -621,7 +679,6 @@ func selectRecentGeneration(ctx context.Context, generations []remote.RecentGene
 		&evtId,
 	)
 	_, err := charm_internal.NewForm(huh.NewForm(selectPrompt)).ExecuteForm()
-
 	if err != nil {
 		return nil, err
 	}
@@ -656,4 +713,111 @@ func configureRegistry(source *workflow.Source, orgSlug, workspaceSlug, sourceNa
 	}
 	source.Registry = registryEntry
 	return nil
+}
+
+const registryHost = "registry.speakeasyapi.dev"
+
+// expandRegistryShorthand expands a registry namespace shorthand to a full registry URI.
+// Accepts formats:
+//   - "namespace" → "registry.speakeasyapi.dev/{org}/{workspace}/namespace@latest" (org/workspace from auth context)
+//   - "org/workspace/namespace" → "registry.speakeasyapi.dev/org/workspace/namespace@latest"
+//   - "org/workspace/namespace@tag" → "registry.speakeasyapi.dev/org/workspace/namespace@tag"
+//   - "org/workspace/namespace:tag" → "registry.speakeasyapi.dev/org/workspace/namespace:tag"
+//
+// Returns the original path unchanged if it doesn't match the shorthand format.
+// For single-part namespace format, orgSlug and workspaceSlug must be provided (from auth context).
+func expandRegistryShorthand(schemaPath, orgSlug, workspaceSlug string) string {
+	// Already a full registry URI
+	if strings.HasPrefix(schemaPath, registryHost) {
+		return schemaPath
+	}
+
+	// Skip URLs
+	if strings.HasPrefix(schemaPath, "http://") || strings.HasPrefix(schemaPath, "https://") {
+		return schemaPath
+	}
+
+	// Skip obvious file paths (contains file extension or starts with . or /)
+	if strings.HasPrefix(schemaPath, ".") || strings.HasPrefix(schemaPath, "/") {
+		return schemaPath
+	}
+	if strings.HasSuffix(schemaPath, ".yaml") || strings.HasSuffix(schemaPath, ".yml") || strings.HasSuffix(schemaPath, ".json") {
+		return schemaPath
+	}
+
+	// Extract tag if present (@ or : separator)
+	pathPart := schemaPath
+	tagPart := "@latest"
+
+	if atIdx := strings.Index(schemaPath, "@"); atIdx != -1 {
+		pathPart = schemaPath[:atIdx]
+		tagPart = schemaPath[atIdx:]
+	} else if colonIdx := strings.LastIndex(schemaPath, ":"); colonIdx != -1 {
+		// Use LastIndex for : to avoid matching drive letters on Windows (C:)
+		pathPart = schemaPath[:colonIdx]
+		tagPart = schemaPath[colonIdx:]
+	}
+
+	parts := strings.Split(pathPart, "/")
+
+	// Validate parts are non-empty and don't contain invalid characters
+	for _, part := range parts {
+		if part == "" || strings.ContainsAny(part, " \t\n") {
+			return schemaPath
+		}
+	}
+
+	switch len(parts) {
+	case 1:
+		// Single part: namespace only - infer org/workspace from auth context
+		if orgSlug == "" || workspaceSlug == "" {
+			return schemaPath
+		}
+		return fmt.Sprintf("%s/%s/%s/%s%s", registryHost, orgSlug, workspaceSlug, pathPart, tagPart)
+	case 3:
+		// Full format: org/workspace/namespace
+		return fmt.Sprintf("%s/%s%s", registryHost, pathPart, tagPart)
+	default:
+		// Invalid format (2 parts or 4+ parts)
+		return schemaPath
+	}
+}
+
+var (
+	ErrMsgFailedToFetchTemplate  = errors.New("failed to fetch template")
+	ErrMsgFailedToSaveTemplate   = errors.New("failed to save template")
+	ErrMsgFailedToDecodeTemplate = errors.New("failed to decode template")
+)
+
+func fetchTemplate(ctx context.Context, templateID string) (*shared.SchemaStoreItem, error) {
+	speakeasyClient, err := sdk.InitSDK()
+	if err != nil {
+		return nil, err
+	}
+
+	schemaStoreItem, err := speakeasyClient.SchemaStore.GetSchemaStoreItem(ctx, &operations.GetSchemaStoreItemRequestBody{
+		ID: &templateID,
+	})
+	if err != nil {
+		return nil, ErrMsgFailedToFetchTemplate
+	}
+
+	return schemaStoreItem.SchemaStoreItem, nil
+}
+
+func saveTemplateToDisk(_ context.Context, schemaStoreItem *shared.SchemaStoreItem) (string, error) {
+	tempDir := os.TempDir()
+	tempFile, err := os.Create(filepath.Join(tempDir, fmt.Sprintf("sandbox-%s.%s", schemaStoreItem.ID, schemaStoreItem.Format)))
+	if err != nil {
+		return "", ErrMsgFailedToSaveTemplate
+	}
+
+	_, err = tempFile.WriteString(schemaStoreItem.Spec)
+	if err != nil {
+		return "", ErrMsgFailedToSaveTemplate
+	}
+
+	defer tempFile.Close()
+
+	return tempFile.Name(), nil
 }

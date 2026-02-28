@@ -5,6 +5,7 @@ package interactivity
 
 import (
 	"fmt"
+
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -35,11 +36,8 @@ func (m *model) Init() tea.Cmd {
 	return m.spinner.Tick
 }
 
-type exitMsg struct{}
-
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg.(type) {
-	case exitMsg:
+	if _, ok := msg.(tea.QuitMsg); ok {
 		m.quit = true
 		return m, tea.Quit
 	}
@@ -53,8 +51,15 @@ func (m *model) View() string {
 		return ""
 	}
 
-	s := fmt.Sprintf("%s\n%s", styles.HeavilyEmphasized.Render(m.message), m.spinner.View())
-	return styles.MakeBoxed(s, styles.Colors.DimYellow, lipgloss.Center)
+	message := styles.HeavilyEmphasized.Render(m.message)
+	messageWidth := lipgloss.Width(message)
+
+	// Pad spinner to message width so the box size remains consistent during animation
+	spinnerView := lipgloss.NewStyle().Width(messageWidth).Align(lipgloss.Center).Render(m.spinner.View())
+
+	s := fmt.Sprintf("%s\n%s", message, spinnerView)
+	// Add trailing newline to prevent the bottom border from being cut off during animation
+	return styles.MakeBoxed(s, styles.Colors.DimYellow, lipgloss.Center) + "\n"
 }
 
 func StartSpinner(message string) func() {
@@ -67,6 +72,8 @@ func StartSpinner(message string) func() {
 	}()
 
 	return func() {
-		p.Send(exitMsg{})
+		p.Quit()
+		// Very important, otherwise the TUI will be borked and future logs will be messed up
+		_ = p.ReleaseTerminal()
 	}
 }

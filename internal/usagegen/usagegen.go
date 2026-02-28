@@ -17,12 +17,21 @@ import (
 
 	"github.com/pkg/errors"
 	changelog "github.com/speakeasy-api/openapi-generation/v2"
+	"github.com/speakeasy-api/openapi-generation/v2/pkg/filesystem"
 	"github.com/speakeasy-api/openapi-generation/v2/pkg/generate"
 	"github.com/speakeasy-api/speakeasy/internal/log"
 	"go.uber.org/zap"
 )
 
-func Generate(ctx context.Context, customerID, lang, schemaPath, header, token, out, operation, namespace, configPath string, all bool, outputBuffer *bytes.Buffer) error {
+func Generate(
+	ctx context.Context,
+	customerID, lang, schemaPath, header, token, out, operation, namespace, configPath string,
+	all bool,
+	outputBuffer *bytes.Buffer,
+	// These should be provided together
+	exampleParams map[string]string,
+	exampleRequestBody *string,
+) error {
 	matchedLanguage := false
 	for _, language := range workflow.SupportedLanguagesUsageSnippets {
 		if language == lang {
@@ -54,14 +63,20 @@ func Generate(ctx context.Context, customerID, lang, schemaPath, header, token, 
 		generate.WithForceGeneration(),
 	}
 
-	if all {
+	switch {
+	case all:
 		opts = append(opts, generate.WithUsageSnippetArgsGenerateAll())
-	} else if operation == "" && namespace == "" {
+	case operation == "" && namespace == "":
 		opts = append(opts, generate.WithUsageSnippetArgsByRootExample())
-	} else if operation != "" {
+	case operation != "":
 		opts = append(opts, generate.WithUsageSnippetArgsByOperationID(operation))
-	} else {
+	default:
 		opts = append(opts, generate.WithUsageSnippetArgsByNamespace(namespace))
+	}
+
+	if exampleRequestBody != nil {
+		opts = append(opts, generate.WithUsageSnippetExampleParams(exampleParams))
+		opts = append(opts, generate.WithUsageSnippetExampleRequestBody(*exampleRequestBody))
 	}
 
 	g, err := generate.New(opts...)
@@ -85,14 +100,15 @@ func Generate(ctx context.Context, customerID, lang, schemaPath, header, token, 
 		return fmt.Errorf("failed to generate usage snippets for %s ✖", lang)
 	}
 
-	if out == "" {
+	switch {
+	case out == "":
 		if outputBuffer == nil {
 			// By default, write to stdout
 			fmt.Println(tmpOutput.String())
 		}
-	} else if isDirectory(out) {
+	case isDirectory(out):
 		return writeFormattedDirectory(lang, out, outputBuffer.String())
-	} else {
+	default:
 		file, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 		if err != nil {
 			return errors.Wrap(err, "cannot write to provided file")
@@ -118,10 +134,10 @@ func writeFormattedDirectory(lang, path, content string) error {
 
 	for _, snippet := range snippets {
 		// TODO: do we still need to do this?
-		//remove the trailing line if it includes an empty comment string
-		//if strings.TrimSpace(lines[len(lines)-1]) == "//" || strings.TrimSpace(lines[len(lines)-1]) == "#" {
-		//	lines = lines[0 : len(lines)-1]
-		//}
+		// remove the trailing line if it includes an empty comment string
+		// if strings.TrimSpace(lines[len(lines)-1]) == "//" || strings.TrimSpace(lines[len(lines)-1]) == "#" {
+		// 	lines = lines[0 : len(lines)-1]
+		// }
 
 		// write out directory structure
 		directoryPath := path + "/" + strings.ToLower(snippet.OperationId)
@@ -187,7 +203,7 @@ func parseOperationInfoAndCodeSample(lang, usageOutputSection string) (*UsageSni
 	}
 
 	// Define a regular expression to capture the API name, method, and endpoint
-	apiDetailsRegex := regexp.MustCompile(`([/\w{}_]+)\s+\((\w+)\s+(.*)\)`)
+	apiDetailsRegex := regexp.MustCompile(`([\w{}_/-]+)\s+\((\w+)\s+(.*)\)`)
 
 	// Find and extract the API details
 	matches := apiDetailsRegex.FindStringSubmatch(parts[0])
@@ -211,7 +227,7 @@ func parseOperationInfoAndCodeSample(lang, usageOutputSection string) (*UsageSni
 }
 
 func writeExampleCode(lang, path, code string) error {
-	outFile := ""
+	var outFile string
 	switch lang {
 	case "go":
 		outFile = path + "/main.go"
@@ -227,8 +243,6 @@ func writeExampleCode(lang, path, code string) error {
 		outFile = path + "/main.py"
 	case "ruby":
 		outFile = path + "/app.rb"
-	case "swift":
-		outFile = path + "/main.swift"
 	case "typescript":
 		outFile = path + "/index.ts"
 	default:
@@ -263,7 +277,7 @@ type fileSystem struct {
 	buf *bytes.Buffer
 }
 
-var _ generate.FileSystem = &fileSystem{}
+var _ filesystem.FileSystem = &fileSystem{}
 
 func (fs *fileSystem) ReadFile(fileName string) ([]byte, error) {
 	return os.ReadFile(fileName)
@@ -275,12 +289,15 @@ func (fs *fileSystem) WriteFile(outFileName string, data []byte, mode os.FileMod
 		_, err := fs.buf.Write(data)
 		return err
 	}
-
 	return nil
 }
 
 func (fs *fileSystem) MkdirAll(path string, mode os.FileMode) error {
 	return nil
+}
+
+func (fs *fileSystem) Remove(name string) error {
+	return os.Remove(name)
 }
 
 func (fs *fileSystem) Open(name string) (fs.File, error) {
@@ -289,4 +306,12 @@ func (fs *fileSystem) Open(name string) (fs.File, error) {
 
 func (fs *fileSystem) Stat(name string) (fs.FileInfo, error) {
 	return os.Stat(name)
+}
+
+func (fs *fileSystem) OpenFile(name string, flag int, perm fs.FileMode) (filesystem.File, error) {
+	return os.OpenFile(name, flag, perm)
+}
+
+func (fs *fileSystem) ScanForGeneratedIDs() (map[string]string, error) {
+	return nil, nil
 }

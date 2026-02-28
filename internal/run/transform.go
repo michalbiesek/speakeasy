@@ -10,9 +10,9 @@ import (
 
 	"github.com/speakeasy-api/sdk-gen-config/workflow"
 	"github.com/speakeasy-api/speakeasy/internal/log"
-	"github.com/speakeasy-api/speakeasy/internal/transform"
 	"github.com/speakeasy-api/speakeasy/internal/utils"
 	"github.com/speakeasy-api/speakeasy/internal/workflowTracking"
+	"github.com/speakeasy-api/speakeasy/pkg/transform"
 )
 
 type Transform struct {
@@ -52,19 +52,20 @@ func (t Transform) Do(ctx context.Context, inputPath string) (string, error) {
 	for _, transformation := range t.source.Transformations {
 		out = &bytes.Buffer{}
 
-		if transformation.Cleanup != nil {
+		switch {
+		case transformation.Cleanup != nil:
 			transformStep.NewSubstep("Cleaning up document")
 
 			if err := transform.CleanupFromReader(ctx, in, inputPath, out, yamlOut); err != nil {
 				return "", err
 			}
-		} else if transformation.RemoveUnused != nil {
+		case transformation.RemoveUnused != nil:
 			transformStep.NewSubstep("Removing unused nodes")
 
 			if err := transform.RemoveUnusedFromReader(ctx, in, inputPath, out, yamlOut); err != nil {
 				return "", err
 			}
-		} else if transformation.FilterOperations != nil {
+		case transformation.FilterOperations != nil:
 			operations := transformation.FilterOperations.ParseOperations()
 			include := true
 			if transformation.FilterOperations.Include != nil {
@@ -82,16 +83,22 @@ func (t Transform) Do(ctx context.Context, inputPath string) (string, error) {
 			if err := transform.FilterOperationsFromReader(ctx, in, inputPath, operations, include, out, yamlOut); err != nil {
 				return "", err
 			}
-		} else if transformation.Format != nil {
+		case transformation.Format != nil:
 			transformStep.NewSubstep("Formatting document")
 
 			if err := transform.FormatFromReader(ctx, in, inputPath, out, yamlOut); err != nil {
 				return "", err
 			}
-		} else if transformation.Normalize != nil {
+		case transformation.Normalize != nil:
 			transformStep.NewSubstep("Normalizing document")
 
 			if err := transform.NormalizeFromReader(ctx, in, inputPath, *transformation.Normalize.PrefixItems, out, yamlOut); err != nil {
+				return "", err
+			}
+		case transformation.JQSymbolicExecution != nil:
+			transformStep.NewSubstep("Applying JQ symbolic execution")
+
+			if err := transform.JQSymbolicExecutionFromReader(ctx, in, inputPath, yamlOut, out); err != nil {
 				return "", err
 			}
 		}
@@ -100,10 +107,10 @@ func (t Transform) Do(ctx context.Context, inputPath string) (string, error) {
 	}
 
 	outFile, err := os.Create(outputPath)
-	defer outFile.Close()
 	if err != nil {
 		return "", err
 	}
+	defer outFile.Close()
 	if _, err := io.Copy(outFile, out); err != nil {
 		return "", err
 	}

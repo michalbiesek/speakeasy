@@ -2,16 +2,19 @@ package errorCodes_test
 
 import (
 	"context"
+	"os"
+	"testing"
+
 	"github.com/speakeasy-api/speakeasy-core/suggestions"
 	"github.com/speakeasy-api/speakeasy/internal/schemas"
 	"github.com/speakeasy-api/speakeasy/internal/suggest/errorCodes"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
-	"os"
-	"testing"
 )
 
 func TestBuildErrorCodesOverlay(t *testing.T) {
+	t.Parallel()
+
 	type args struct {
 		name, in, out string
 	}
@@ -24,14 +27,19 @@ func TestBuildErrorCodesOverlay(t *testing.T) {
 
 	for _, tt := range toTest {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			ctx := context.Background()
 
 			overlay, err := errorCodes.BuildErrorCodesOverlay(ctx, tt.in)
-
-			_, _, model, err := schemas.LoadDocument(ctx, tt.in)
 			require.NoError(t, err)
-			root := model.Index.GetRootNode()
-			err = overlay.ApplyTo(root)
+
+			schemaBytes, err := os.ReadFile(tt.in)
+			require.NoError(t, err)
+
+			var root yaml.Node
+			require.NoError(t, yaml.Unmarshal(schemaBytes, &root))
+			err = overlay.ApplyTo(&root)
 			require.NoError(t, err)
 
 			// Read the expected YAML file
@@ -39,7 +47,7 @@ func TestBuildErrorCodesOverlay(t *testing.T) {
 			require.NoError(t, err)
 
 			// Convert root to YAML
-			actualBytes, err := yaml.Marshal(root)
+			actualBytes, err := yaml.Marshal(&root)
 			require.NoError(t, err)
 
 			// Compare the actual and expected YAML
@@ -49,6 +57,8 @@ func TestBuildErrorCodesOverlay(t *testing.T) {
 }
 
 func TestDiagnose(t *testing.T) {
+	t.Parallel()
+
 	type args struct {
 		name, schema  string
 		expectedCount int
@@ -60,13 +70,15 @@ func TestDiagnose(t *testing.T) {
 
 	for _, tt := range toTest {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			ctx := context.Background()
-			_, _, model, err := schemas.LoadDocument(ctx, tt.schema)
+			_, doc, err := schemas.LoadDocument(ctx, tt.schema)
 			require.NoError(t, err)
 
-			diagnosis := errorCodes.Diagnose(model.Model)
+			diagnosis := errorCodes.Diagnose(doc)
 			if tt.expectedCount == 0 {
-				require.Len(t, diagnosis, 0)
+				require.Empty(t, diagnosis)
 				return
 			}
 			require.Len(t, diagnosis, 1)

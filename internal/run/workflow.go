@@ -3,10 +3,13 @@ package run
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/speakeasy-api/speakeasy/registry"
+	"gopkg.in/yaml.v3"
 
+	"github.com/speakeasy-api/openapi-generation/v2/pkg/generate"
 	"github.com/speakeasy-api/sdk-gen-config/workflow"
 	"github.com/speakeasy-api/speakeasy-core/events"
 	"github.com/speakeasy-api/speakeasy/internal/log"
@@ -33,19 +36,24 @@ type Workflow struct {
 	SkipCleanup            bool
 	FromQuickstart         bool
 	SkipGenerateLintReport bool
+	SourceLocation         string
 	RepoSubDirs            map[string]string
 	InstallationURLs       map[string]string
 	RegistryTags           []string
 
 	// Enable if target testing should be explicitly disabled, regardless of the
 	// workflow configuration enabling testing.
-	SkipTesting bool
+	SkipTesting   bool
+	BoostrapTests bool
+	AutoYes       bool
+	AllowPrompts  bool
 
 	// Internal
 	workflowName       string
 	SDKOverviewURLs    map[string]string
 	RootStep           *workflowTracking.WorkflowStep
 	workflow           workflow.Workflow
+	workflowRaw        string // the raw workflow YAML content
 	ProjectDir         string
 	validatedDocuments []string
 	generationAccess   *sdkgen.GenerationAccess
@@ -56,10 +64,14 @@ type Workflow struct {
 	computedChanges map[string]bool
 	SourceResults   map[string]*SourceResult
 	TargetResults   map[string]*TargetResult
-	OnSourceResult  func(*SourceResult, string)
+	OnSourceResult  SourceResultCallback
 	Duration        time.Duration
 	criticalWarns   []string
 	Error           error
+
+	// Studio
+	CancellableGeneration *sdkgen.CancellableGeneration
+	StreamableGeneration  *sdkgen.StreamableGeneration
 }
 
 type Opt func(w *Workflow)
@@ -73,9 +85,21 @@ func NewWorkflow(
 		return nil, fmt.Errorf("failed to load workflow.yaml: %w", err)
 	}
 
+	// Marshal the workflow to get the YAML content
+	workflowRawBytes, err := yaml.Marshal(wf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal workflow: %w", err)
+	}
+	workflowRaw := string(workflowRawBytes)
+
 	// Load the current lockfile so that we don't overwrite all targets
 	lockfile, err := workflow.LoadLockfile(projectDir)
-	lockfileOld := lockfile
+
+	// Deep copy the lockfile to preserve the original state before modifications
+	var lockfileOld *workflow.LockFile
+	if lockfile != nil {
+		lockfileOld = deepCopyLockfile(lockfile)
+	}
 
 	if err != nil || lockfile == nil {
 		lockfile = &workflow.LockFile{
@@ -95,11 +119,12 @@ func NewWorkflow(
 		Debug:            false,
 		ShouldCompile:    true,
 		workflow:         *wf,
+		workflowRaw:      workflowRaw,
 		ProjectDir:       projectDir,
 		ForceGeneration:  false,
 		SourceResults:    make(map[string]*SourceResult),
 		TargetResults:    make(map[string]*TargetResult),
-		OnSourceResult:   func(*SourceResult, string) {},
+		OnSourceResult:   func(*SourceResult, SourceStepID) error { return nil },
 		computedChanges:  make(map[string]bool),
 		lockfile:         lockfile,
 		lockfileOld:      lockfileOld,
@@ -123,6 +148,18 @@ func WithWorkflowName(name string) Opt {
 func WithSource(source string) Opt {
 	return func(w *Workflow) {
 		w.Source = source
+	}
+}
+
+func WithSourceLocation(sourceLocation string) Opt {
+	return func(w *Workflow) {
+		w.SourceLocation = sourceLocation
+		if sourceLocation != "" {
+			// Implies no snapshot
+			w.SkipSnapshot = true
+			// Implies no change report
+			w.SkipChangeReport = true
+		}
 	}
 }
 
@@ -151,6 +188,15 @@ func WithSkipVersioning(skipVersioning bool) Opt {
 func WithTarget(target string) Opt {
 	return func(w *Workflow) {
 		w.Target = target
+	}
+}
+
+func WithBoostrapTests() Opt {
+	return func(w *Workflow) {
+		w.BoostrapTests = true
+		w.ShouldCompile = true
+		w.SkipTesting = true
+		w.SkipVersioning = true
 	}
 }
 
@@ -228,6 +274,18 @@ func WithSkipTesting(skipTesting bool) Opt {
 	}
 }
 
+func WithAutoYes(autoYes bool) Opt {
+	return func(w *Workflow) {
+		w.AutoYes = autoYes
+	}
+}
+
+func WithAllowPrompts(allowPrompts bool) Opt {
+	return func(w *Workflow) {
+		w.AllowPrompts = allowPrompts
+	}
+}
+
 func WithFromQuickstart(fromQuickstart bool) Opt {
 	return func(w *Workflow) {
 		w.FromQuickstart = fromQuickstart
@@ -249,6 +307,42 @@ func WithInstallationURLs(installationURLs map[string]string) Opt {
 func WithRegistryTags(registryTags []string) Opt {
 	return func(w *Workflow) {
 		w.RegistryTags = registryTags
+	}
+}
+
+func WithSourceUpdates(onSourceResult SourceResultCallback) Opt {
+	if onSourceResult != nil {
+		return func(w *Workflow) {
+			w.OnSourceResult = onSourceResult
+		}
+	}
+
+	return func(w *Workflow) {
+		w.OnSourceResult = func(sourceRes *SourceResult, sourceStep SourceStepID) error { return nil }
+	}
+}
+
+func WithCancellableGeneration(cancellable bool) Opt {
+	return func(w *Workflow) {
+		if cancellable {
+			w.CancellableGeneration = &sdkgen.CancellableGeneration{
+				CancellationMutex: sync.Mutex{},
+				// CancelCtx and CancelFunc fields depend on the runTarget context
+				// and will be set right before generation starts.
+			}
+		} else {
+			w.CancellableGeneration = nil
+		}
+	}
+}
+
+func WithStreamableGeneration(onProgressUpdate func(generate.ProgressUpdate), genSteps, fileStatus bool) Opt {
+	return func(w *Workflow) {
+		w.StreamableGeneration = &sdkgen.StreamableGeneration{
+			OnProgressUpdate: onProgressUpdate,
+			GenSteps:         genSteps,
+			FileStatus:       fileStatus,
+		}
 	}
 }
 
@@ -294,4 +388,25 @@ func Migrate(ctx context.Context, wf *workflow.Workflow) {
 	} else {
 		*wf = wf.MigrateNoTelemetry()
 	}
+}
+
+// deepCopyLockfile creates a deep copy of a LockFile by marshaling and unmarshaling
+func deepCopyLockfile(lf *workflow.LockFile) *workflow.LockFile {
+	if lf == nil {
+		return nil
+	}
+
+	// Marshal to YAML
+	data, err := yaml.Marshal(lf)
+	if err != nil {
+		return nil
+	}
+
+	// Unmarshal into new struct
+	var lfCopy workflow.LockFile
+	if err := yaml.Unmarshal(data, &lfCopy); err != nil {
+		return nil
+	}
+
+	return &lfCopy
 }

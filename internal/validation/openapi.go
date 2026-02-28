@@ -3,10 +3,12 @@ package validation
 import (
 	"context"
 	"fmt"
-	"github.com/speakeasy-api/sdk-gen-config/lint"
 	"io"
+	"os"
 	"slices"
 	"strings"
+
+	"github.com/speakeasy-api/sdk-gen-config/lint"
 
 	"github.com/speakeasy-api/speakeasy-core/openapi"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/speakeasy-api/speakeasy/internal/interactivity"
 	"github.com/speakeasy-api/speakeasy/internal/log"
 	"go.uber.org/zap"
+	"gopkg.in/yaml.v3"
 )
 
 // OutputLimits defines the limits for validation output.
@@ -57,7 +60,7 @@ func ValidateWithInteractivity(ctx context.Context, schemaPath, header, token st
 		return nil, fmt.Errorf("failed to get document contents: %w", err)
 	}
 
-	res, err := Validate(ctx, logger, schema, schemaPath, limits, isRemote, defaultRuleset, workingDir, false, skipGenerateReport)
+	res, err := Validate(ctx, logger, schema, schemaPath, limits, isRemote, defaultRuleset, workingDir, false, skipGenerateReport, "")
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +103,7 @@ func ValidateWithInteractivity(ctx context.Context, schemaPath, header, token st
 	return res, nil
 }
 
-func ValidateOpenAPI(ctx context.Context, source, schemaPath, header, token string, limits *OutputLimits, defaultRuleset, workingDir string, isQuickstart bool, skipGenerateReport bool) (*ValidationResult, error) {
+func ValidateOpenAPI(ctx context.Context, source, schemaPath, header, token string, limits *OutputLimits, defaultRuleset, workingDir string, isQuickstart bool, skipGenerateReport bool, target string) (*ValidationResult, error) {
 	logger := log.From(ctx)
 	logger.Info("Linting OpenAPI document...\n")
 
@@ -111,7 +114,7 @@ func ValidateOpenAPI(ctx context.Context, source, schemaPath, header, token stri
 
 	prefixedLogger := logger.WithAssociatedFile(schemaPath).WithFormatter(log.PrefixedFormatter)
 
-	res, err := Validate(ctx, logger, schema, schemaPath, limits, isRemote, defaultRuleset, workingDir, isQuickstart, skipGenerateReport)
+	res, err := Validate(ctx, logger, schema, schemaPath, limits, isRemote, defaultRuleset, workingDir, isQuickstart, skipGenerateReport, target)
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +143,7 @@ func ValidateOpenAPI(ctx context.Context, source, schemaPath, header, token stri
 	})
 
 	if len(res.Errors) > 0 {
-		return res, fmt.Errorf(res.Status)
+		return res, errors.New(res.Status)
 	}
 
 	if len(res.Warnings) > 0 {
@@ -167,14 +170,14 @@ func errorsToTabContents(schema []byte, errs []error) []interactivity.Inspectabl
 	for _, err := range errs {
 		vErr := errors.GetValidationErr(err)
 
-		s := ""
+		var s string
 		var details *string
 
 		// Need to account for non-validation errors
 		if vErr == nil {
 			s = fmt.Sprintf("%v", err)
 		} else {
-			lineNumber := styles.SeverityToStyle(vErr.Severity).Render(fmt.Sprintf("Line %d:", vErr.LineNumber))
+			lineNumber := styles.SeverityToStyle(vErr.Severity).Render(fmt.Sprintf("Line %d:%d - ", vErr.GetLineNumber(), vErr.GetColumnNumber()))
 			errType := styles.Dimmed.Render(vErr.Rule)
 			s = fmt.Sprintf("%s %s - %s", lineNumber, errType, vErr.Message)
 			d := getDetailedView(lines, *vErr)
@@ -204,12 +207,12 @@ func errorsToTabContents(schema []byte, errs []error) []interactivity.Inspectabl
 func getDetailedView(lines []string, err errors.ValidationError) string {
 	var sb strings.Builder
 
-	errAndLine := styles.SeverityToStyle(err.Severity).Render(fmt.Sprintf("%s on line %d", err.Severity, err.LineNumber))
+	errAndLine := styles.SeverityToStyle(err.Severity).Render(fmt.Sprintf("%s on line %d:%d", err.Severity, err.GetLineNumber(), err.GetColumnNumber()))
 	sb.WriteString(fmt.Sprintf("%s %s\n", errAndLine, styles.Dimmed.Render(err.Rule)))
 	sb.WriteString(err.Message)
 	sb.WriteString("\n\n")
 
-	if err.LineNumber < 0 || err.LineNumber > len(lines)-1 {
+	if err.GetLineNumber() < 0 || err.GetLineNumber() > len(lines)-1 {
 		sb.WriteString(styles.Dimmed.Render("This error does not apply to any specific line."))
 		return sb.String()
 	}
@@ -217,12 +220,12 @@ func getDetailedView(lines []string, err errors.ValidationError) string {
 	sb.WriteString(styles.Emphasized.Render("Surrounding Lines:"))
 	sb.WriteString("\n")
 
-	startLine := err.LineNumber - 4
+	startLine := err.GetLineNumber() - 4
 	if startLine < 0 {
 		startLine = 0
 	}
 
-	endLine := err.LineNumber + 3
+	endLine := err.GetLineNumber() + 3
 	if endLine > len(lines)-1 {
 		endLine = len(lines) - 1
 	}
@@ -239,7 +242,7 @@ func getDetailedView(lines []string, err errors.ValidationError) string {
 	for i, line := range lines[startLine:endLine] {
 		lineNumber := startLine + i + 1
 		lineNumString := styles.Dimmed.Render(fmt.Sprintf("%d", lineNumber))
-		if lineNumber == err.LineNumber {
+		if lineNumber == err.GetLineNumber() {
 			lineNumString = styles.Error.Render(fmt.Sprintf("%d", lineNumber))
 		}
 
@@ -252,13 +255,14 @@ func getDetailedView(lines []string, err errors.ValidationError) string {
 }
 
 // Validate returns (validation errors, validation warnings, validation info, error)
-func Validate(ctx context.Context, outputLogger log.Logger, schema []byte, schemaPath string, limits *OutputLimits, isRemote bool, defaultRuleset, workingDir string, parseValidOperations bool, skipGenerateReport bool) (*ValidationResult, error) {
+func Validate(ctx context.Context, outputLogger log.Logger, schema []byte, schemaPath string, limits *OutputLimits, isRemote bool, defaultRuleset, workingDir string, parseValidOperations bool, skipGenerateReport bool, target string) (*ValidationResult, error) {
 	l := log.From(ctx).WithFormatter(log.PrefixedFormatter)
 
 	opts := []generate.GeneratorOptions{
 		generate.WithDontWrite(),
 		generate.WithLogger(l),
 		generate.WithRunLocation("cli"),
+		generate.WithWarningLoggerDisabled(),
 	}
 
 	if parseValidOperations {
@@ -285,7 +289,14 @@ func Validate(ctx context.Context, outputLogger log.Logger, schema []byte, schem
 		return nil, err
 	}
 
-	res, err := g.Validate(ctx, schema, schemaPath, isRemote, workingDir)
+	validateOpts := generate.ValidateOpts{
+		Schema:     schema,
+		SchemaPath: schemaPath,
+		IsRemote:   isRemote,
+		WorkingDir: workingDir,
+		Target:     target,
+	}
+	res, err := g.ValidateWithOpts(ctx, validateOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -298,11 +309,12 @@ func Validate(ctx context.Context, outputLogger log.Logger, schema []byte, schem
 
 		switch {
 		case vErr != nil:
-			if vErr.Severity == errors.SeverityError {
+			switch vErr.Severity {
+			case errors.SeverityError:
 				vErrs = append(vErrs, vErr)
-			} else if vErr.Severity == errors.SeverityWarn {
+			case errors.SeverityWarn:
 				vWarns = append(vWarns, vErr)
-			} else {
+			default:
 				vInfo = append(vInfo, vErr)
 			}
 		case uErr != nil:
@@ -330,7 +342,7 @@ func Validate(ctx context.Context, outputLogger log.Logger, schema []byte, schem
 
 	if len(vErrs) > 0 {
 		status = "OpenAPI document invalid ✖"
-	} else if len(vErrs) > 0 {
+	} else if len(vWarns) > 0 {
 		status = "OpenAPI document valid with warnings ⚠"
 	}
 
@@ -373,4 +385,41 @@ type validationResult interface {
 func generateReport(ctx context.Context, res validationResult) (reports.ReportResult, error) {
 	reportBytes := res.GenerateReport()
 	return reports.UploadReport(ctx, reportBytes, shared.TypeLinting)
+}
+
+// LooksLikeAnOpenAPISpec performs a basic check to determine if a file appears to be an OpenAPI spec.
+// It checks:
+// 1. The file can be unmarshaled as YAML (which also covers JSON)
+// 2. The file has the top-level keys: "openapi", "info", and "paths"
+//
+// This is a loose check intended to identify files that are likely OpenAPI specs even if they
+// have validation errors.
+func LooksLikeAnOpenAPISpec(schemaPath string) bool {
+	content, err := os.ReadFile(schemaPath)
+	if err != nil {
+		return false
+	}
+
+	return LooksLikeAnOpenAPISpecContent(content)
+}
+
+// LooksLikeAnOpenAPISpecContent performs a basic check on content to determine if it appears to be an OpenAPI spec.
+// It checks:
+// 1. The content can be unmarshaled as YAML (which also covers JSON)
+// 2. The content has the top-level keys: "openapi", "info", and "paths"
+func LooksLikeAnOpenAPISpecContent(content []byte) bool {
+	var doc map[string]any
+	if err := yaml.Unmarshal(content, &doc); err != nil {
+		return false
+	}
+
+	// Check for required top-level keys
+	requiredKeys := []string{"openapi", "info", "paths"}
+	for _, key := range requiredKeys {
+		if _, ok := doc[key]; !ok {
+			return false
+		}
+	}
+
+	return true
 }

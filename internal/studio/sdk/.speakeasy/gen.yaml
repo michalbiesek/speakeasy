@@ -4,18 +4,27 @@ generation:
   maintainOpenAPIOrder: true
   usageSnippets:
     optionalPropertyRendering: withExample
+    sdkInitStyle: constructor
   useClassNamesForArrayFields: true
   fixes:
     nameResolutionDec2023: true
+    nameResolutionFeb2025: true
     parameterOrderingFeb2024: true
     requestResponseComponentNamesFeb2024: true
+    securityFeb2025: true
+    sharedErrorComponentsApr2025: true
   auth:
     oAuth2ClientCredentialsEnabled: false
     oAuth2PasswordEnabled: false
+  tests:
+    generateTests: true
+    generateNewTests: false
+    skipResponseBodyAssertions: false
 go:
-  version: 0.8.7
+  version: 0.11.0
   additionalDependencies: {}
   allowUnknownFieldsInWeakUnions: false
+  baseErrorName: SDKBaseError
   clientServerStatusCodesAsErrors: true
   defaultErrorName: SDKError
   flattenGlobalSecurity: true
@@ -33,3 +42,35 @@ go:
   outputModelSuffix: output
   packageName: github.com/speakeasy-api/speakeasy/internal/studio/sdk
   responseFormat: envelope-http
+typescript:
+  version: 0.18.1
+  additionalDependencies:
+    dependencies: {}
+    devDependencies: {}
+    peerDependencies: {}
+  additionalPackageJSON: {}
+  author: Speakeasy
+  clientServerStatusCodesAsErrors: true
+  defaultErrorName: SDKError
+  enableCustomCodeRegions: false
+  enableReactQuery: false
+  enumFormat: union
+  flattenGlobalSecurity: true
+  flatteningOrder: body-first
+  imports:
+    option: openapi
+    paths:
+      callbacks: models/callbacks
+      errors: models/errors
+      operations: models/operations
+      shared: models/components
+      webhooks: models/webhooks
+  inputModelSuffix: input
+  maxMethodParams: 0
+  methodArguments: require-security-and-request
+  moduleFormat: commonjs
+  outputModelSuffix: output
+  packageName: '@speakeasy-api/studio'
+  responseFormat: flat
+  templateVersion: v2
+  useIndexModules: true

@@ -3,6 +3,9 @@ package git
 import (
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"strings"
 
 	gitc "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
@@ -54,6 +57,89 @@ func (r *Repository) IsNil() bool {
 	return r.repo == nil
 }
 
+// GoGitRepo returns the underlying go-git repository for advanced operations.
+// Prefer using Repository methods when possible; use this only when you need
+// direct access to go-git APIs not exposed by Repository.
+func (r *Repository) GoGitRepo() *gitc.Repository {
+	return r.repo
+}
+
+// SetGoGitRepo replaces the underlying go-git repository.
+// This is used by callers that manage the repository lifecycle externally
+// (e.g. after cloning).
+func (r *Repository) SetGoGitRepo(repo *gitc.Repository) {
+	r.repo = repo
+}
+
+// Root returns the root directory of the repository (where .git is located).
+// Returns empty string if the repository is not initialized.
+func (r *Repository) Root() string {
+	if r.repo == nil {
+		return ""
+	}
+
+	// Get the worktree to find the filesystem root
+	wt, err := r.repo.Worktree()
+	if err != nil {
+		return ""
+	}
+
+	return wt.Filesystem.Root()
+}
+
+// HasObject checks if a blob or commit exists in the local object database.
+// Uses native git commands to ensure we see objects fetched by native git fetch.
+func (r *Repository) HasObject(hash string) bool {
+	if r.repo == nil {
+		return false
+	}
+
+	// Strip "sha1:" prefix if present
+	hash = strings.TrimPrefix(hash, "sha1:")
+
+	// Use native git to check object existence.
+	// This is necessary because go-git's storer may not see objects
+	// that were fetched via native git fetch commands.
+	_, err := r.RunGitCommandInRepo("cat-file", "-e", hash)
+	return err == nil
+}
+
+// FetchRef fetches a specific ref from origin.
+// refSpec format: "+refs/speakeasy/gen/uuid:refs/speakeasy/gen/uuid"
+func (r *Repository) FetchRef(refSpec string) error {
+	if r.repo == nil {
+		return nil
+	}
+
+	if _, err := r.repo.Remote("origin"); err != nil {
+		return fmt.Errorf("remote 'origin' not found: %w", err)
+	}
+
+	cmd := exec.Command("git", "fetch", "--force", "origin", refSpec)
+	cmd.Dir = r.Root()
+	cmd.Env = os.Environ()
+
+	return cmd.Run()
+}
+
+// PushRef pushes a ref to origin.
+// refSpec format: "refs/speakeasy/gen/uuid:refs/speakeasy/gen/uuid"
+func (r *Repository) PushRef(refSpec string) error {
+	if r.repo == nil {
+		return nil
+	}
+
+	if _, err := r.repo.Remote("origin"); err != nil {
+		return fmt.Errorf("remote 'origin' not found: %w", err)
+	}
+
+	cmd := exec.Command("git", "push", "origin", refSpec)
+	cmd.Dir = r.Root()
+	cmd.Env = os.Environ()
+
+	return cmd.Run()
+}
+
 func (r *Repository) HeadHash() (string, error) {
 	if r.IsNil() {
 		return "", nil
@@ -67,6 +153,78 @@ func (r *Repository) HeadHash() (string, error) {
 	}
 
 	return head.Hash().String(), nil
+}
+
+// GetCurrentBranch returns the short name of the current branch (e.g. "main").
+// Returns an error if the repository is not initialized or HEAD is detached.
+func (r *Repository) GetCurrentBranch() (string, error) {
+	if r.IsNil() {
+		return "", fmt.Errorf("repository not initialized")
+	}
+
+	head, err := r.repo.Head()
+	if err != nil {
+		return "", fmt.Errorf("error getting head: %w", err)
+	}
+
+	return head.Name().Short(), nil
+}
+
+// HeadBranch returns the short name of the current branch.
+// Returns empty string (and no error) if the repository is nil, HEAD is
+// detached, or no commits exist yet.
+func (r *Repository) HeadBranch() (string, error) {
+	if r.IsNil() {
+		return "", nil
+	}
+
+	head, err := r.repo.Head()
+	if errors.Is(err, plumbing.ErrReferenceNotFound) {
+		return "", nil
+	} else if err != nil {
+		return "", fmt.Errorf("git: %w", err)
+	}
+
+	if head.Name().IsBranch() {
+		return head.Name().Short(), nil
+	}
+
+	return "", nil // detached HEAD
+}
+
+// CheckoutBranch checks out an existing branch by name.
+// The branchName should be a short name (e.g. "main"), not a full ref.
+func (r *Repository) CheckoutBranch(branchName string) error {
+	if r.IsNil() {
+		return fmt.Errorf("repository not initialized")
+	}
+
+	wt, err := r.repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	return wt.Checkout(&gitc.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName(branchName),
+	})
+}
+
+// CreateBranch creates a new branch from the current HEAD and checks it out.
+// The branchName should be a short name (e.g. "feature-x"), not a full ref.
+func (r *Repository) CreateBranch(branchName string) error {
+	if r.IsNil() {
+		return fmt.Errorf("repository not initialized")
+	}
+
+	wt, err := r.repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	return wt.Checkout(&gitc.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName(branchName),
+		Create: true,
+	})
 }
 
 const (

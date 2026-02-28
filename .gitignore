@@ -1,10 +1,16 @@
 dist/
+/docs/
 bin/
 .idea/
 *.iml
 summary.md
 /.speakeasy/
 temp/
-integration/temp
+integrationTests/
 .DS_Store
 .vscode/launch.json
+__debug_bin*
+/completions/
+
+**/.claude/settings.local.json
+.beads

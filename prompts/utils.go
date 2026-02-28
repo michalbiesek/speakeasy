@@ -2,34 +2,24 @@ package prompts
 
 import (
 	"fmt"
-	"github.com/speakeasy-api/speakeasy/internal/charm/styles"
 	"os"
-	"strings"
+	"slices"
+
+	"github.com/speakeasy-api/speakeasy/internal/charm/styles"
 
 	"github.com/speakeasy-api/huh"
 	"github.com/speakeasy-api/openapi-generation/v2/pkg/generate"
 	"github.com/speakeasy-api/sdk-gen-config/workflow"
 )
 
-var priorityTargets = []string{
+var prioritySDKTargets = []string{
 	"typescript",
 	"python",
 	"go",
 	"java",
-	"terraform",
 	"csharp",
-	"unity",
 	"php",
-}
-
-func inPriorityTargets(target string) bool {
-	for _, priorityTarget := range priorityTargets {
-		if target == priorityTarget {
-			return true
-		}
-	}
-
-	return false
+	"ruby",
 }
 
 func getSourcesFromWorkflow(inputWorkflow *workflow.Workflow) []string {
@@ -40,13 +30,25 @@ func getSourcesFromWorkflow(inputWorkflow *workflow.Workflow) []string {
 	return sources
 }
 
-func GetTargetOptions() []huh.Option[string] {
+func getMCPTargetOptions() []huh.Option[string] {
 	options := []huh.Option[string]{}
+	targets := generate.GetSupportedMCPTargets()
 
-	targets := generate.GetSupportedTargets()
+	for _, target := range targets {
+		if target.Target == "mcp-typescript" {
+			options = append(options, huh.NewOption("TypeScript Server "+getMaturityDisplay(string(target.Maturity)), "mcp-typescript"))
+		}
+	}
+
+	return options
+}
+
+func getSDKTargetOptions() []huh.Option[string] {
+	options := []huh.Option[string]{}
+	targets := generate.GetSupportedSDKTargets()
 
 	// priority ordering
-	for _, target := range priorityTargets {
+	for _, target := range prioritySDKTargets {
 		for _, supportedTarget := range targets {
 			if supportedTarget.Target == target {
 				options = append(options, targetOption(supportedTarget.Target, string(supportedTarget.Maturity)))
@@ -56,7 +58,7 @@ func GetTargetOptions() []huh.Option[string] {
 	}
 
 	for _, target := range targets {
-		if inPriorityTargets(target.Target) || target.Target == "docs" {
+		if slices.Contains(prioritySDKTargets, target.Target) {
 			continue
 		}
 
@@ -66,34 +68,26 @@ func GetTargetOptions() []huh.Option[string] {
 	return options
 }
 
-func getTargetMaturity(target string) string {
-	for _, supportedTarget := range generate.GetSupportedTargets() {
-		if supportedTarget.Target == target {
-			return string(supportedTarget.Maturity)
-		}
+func getTerraformTargetOptions() []huh.Option[string] {
+	return []huh.Option[string]{
+		huh.NewOption("Go", "terraform"),
 	}
+}
 
-	return ""
+func getTargetMaturity(target string) string {
+	return generate.GetTargetNameMaturity(target)
 }
 
 func targetOption(target, maturity string) huh.Option[string] {
 	return huh.NewOption(fmt.Sprintf("%s %s", getTargetDisplay(target), getMaturityDisplay(maturity)), target)
 }
 
-func GetSupportedTargets() []string {
-	targets := generate.GetSupportedLanguages()
-	filteredTargets := []string{}
+func GetSupportedTargetNames() []string {
+	targetNames := generate.GetSupportedTargetNames()
 
-	filteredTargets = append(filteredTargets, priorityTargets...)
+	slices.Sort(targetNames)
 
-	for _, language := range targets {
-		if strings.HasSuffix(language, "v2") || inPriorityTargets(language) || language == "docs" {
-			continue
-		}
-		filteredTargets = append(filteredTargets, language)
-	}
-
-	return filteredTargets
+	return targetNames
 }
 
 func getCurrentInputs(currentSource *workflow.Source) []string {
@@ -128,8 +122,6 @@ func getTargetDisplay(target string) string {
 		return "Go"
 	case "java":
 		return "Java"
-	case "terraform":
-		return "Terraform"
 	case "csharp":
 		return "C#"
 	case "unity":
@@ -140,8 +132,6 @@ func getTargetDisplay(target string) string {
 		return "Postman"
 	case "ruby":
 		return "Ruby"
-	case "swift":
-		return "Swift"
 	}
 
 	return target

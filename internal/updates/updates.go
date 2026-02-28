@@ -5,29 +5,40 @@ import (
 	"archive/zip"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/speakeasy-api/speakeasy-core/events"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/speakeasy-api/speakeasy-core/events"
+
 	"github.com/speakeasy-api/speakeasy/internal/cache"
 	"github.com/speakeasy-api/speakeasy/internal/charm/styles"
 	"github.com/speakeasy-api/speakeasy/internal/env"
+	"github.com/speakeasy-api/speakeasy/internal/locks"
 	"github.com/speakeasy-api/speakeasy/internal/log"
 
-	"github.com/google/go-github/v58/github"
+	"github.com/google/go-github/v63/github"
 	"github.com/hashicorp/go-version"
 )
 
+type contextKey string
+
 const (
-	ArtifactArchContextKey         = "cli-artifact-arch"
-	GitHubReleaseRateLimitingLimit = time.Second * 60
+	ArtifactArchContextKey         contextKey = "cli-artifact-arch"
+	GitHubReleaseRateLimitingLimit            = time.Second * 60
+	fallbackBaseURL                           = "https://cli-releases.speakeasy.com"
 )
+
+type fallbackDownloadResponse struct {
+	URL string `json:"url"`
+}
 
 type ReleaseCache struct {
 	Repo    *github.RepositoryRelease
@@ -108,6 +119,18 @@ func Update(ctx context.Context, currentVersion, artifactArch string, timeout in
 // InstallVersion installs a specific version of the CLI
 // returns the path to the installed binary
 func InstallVersion(ctx context.Context, desiredVersion, artifactArch string, timeout int) (string, error) {
+	mutex := locks.CLIUpdateLock()
+	for result := range mutex.TryLock(ctx, 1*time.Second) {
+		if result.Error != nil {
+			return "", result.Error
+		}
+		if result.Success {
+			break
+		}
+		log.From(ctx).WithStyle(styles.DimmedItalic).Debug(fmt.Sprintf("InstallVersion: Failed to acquire lock (attempt %d). Retrying...", result.Attempt))
+	}
+	defer func() { _ = mutex.Unlock() }()
+
 	v, err := version.NewVersion(desiredVersion)
 	if err != nil {
 		return "", err
@@ -173,7 +196,7 @@ func install(artifactArch, downloadURL, installLocation string, timeout int) err
 		return err
 	}
 
-	defer os.RemoveAll(dirName)
+	defer func() { _ = os.RemoveAll(dirName) }()
 
 	downloadedPath, err := downloadCLI(dirName, downloadURL, timeout)
 	if err != nil {
@@ -220,7 +243,6 @@ func install(artifactArch, downloadURL, installLocation string, timeout int) err
 		}
 
 		tmpBinaryFile, err := os.Open(tmpBinaryLocation)
-
 		if err != nil {
 			return fmt.Errorf("failed to replace binary: unable to open source file: %w", err)
 		}
@@ -235,7 +257,6 @@ func install(artifactArch, downloadURL, installLocation string, timeout int) err
 		installLocationNew := installLocation + ".new"
 
 		installFileNew, err := os.Create(installLocationNew)
-
 		if err != nil {
 			return fmt.Errorf("failed to replace binary: unable to create destination file: %w", err)
 		}
@@ -290,12 +311,16 @@ func getLatestRelease(ctx context.Context, artifactArch string, timeout time.Dur
 
 	cached, err := releaseCache.Get()
 	if err == nil {
-		return cached.Repo, cached.Release, err
+		return cached.Repo, cached.Release, nil
 	}
 
 	releases, _, err := client.Repositories.ListReleases(context.Background(), "speakeasy-api", "speakeasy", nil)
 	if err != nil {
-		return nil, nil, err
+		var fallbackErr error
+		releases, fallbackErr = fetchReleasesFromFallback(timeout)
+		if fallbackErr != nil {
+			return nil, nil, err // return original error
+		}
 	}
 
 	if len(releases) == 0 {
@@ -336,7 +361,20 @@ func getReleaseForVersion(ctx context.Context, version version.Version, artifact
 	} else {
 		release, _, err = client.Repositories.GetReleaseByTag(context.Background(), "speakeasy-api", "speakeasy", tag)
 		if err != nil {
-			return nil, nil, err
+			// Fall back to the caching proxy and filter by tag.
+			releases, fallbackErr := fetchReleasesFromFallback(timeout)
+			if fallbackErr != nil {
+				return nil, nil, err // return original error
+			}
+			for _, r := range releases {
+				if r.GetTagName() == tag {
+					release = r
+					break
+				}
+			}
+			if release == nil {
+				return nil, nil, fmt.Errorf("release %s not found", tag)
+			}
 		}
 		_ = cache.Store(release)
 	}
@@ -354,18 +392,29 @@ func getReleaseForVersion(ctx context.Context, version version.Version, artifact
 }
 
 func downloadCLI(dest, link string, timeout int) (string, error) {
-	download, err := os.Create(filepath.Join(dest, filepath.Base(link)))
-	if err != nil {
-		return "", err
-	}
-	defer download.Close()
+	downloadURL := link
 
 	c := &http.Client{
 		Timeout: time.Duration(timeout) * time.Second,
 	}
-	resp, err := c.Get(link)
-	if err != nil {
-		return "", err
+	resp, err := c.Get(downloadURL)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		// Try fallback: resolve a signed URL via the caching proxy.
+		fallbackURL, fallbackErr := getFallbackDownloadURL(link, time.Duration(timeout)*time.Second)
+		if fallbackErr != nil {
+			if err != nil {
+				return "", err // return original error
+			}
+			return "", fmt.Errorf("failed to download artifact: %s", resp.Status)
+		}
+		downloadURL = fallbackURL
+		resp, err = c.Get(downloadURL)
+		if err != nil {
+			return "", err
+		}
 	}
 	defer resp.Body.Close()
 
@@ -373,11 +422,81 @@ func downloadCLI(dest, link string, timeout int) (string, error) {
 		return "", fmt.Errorf("failed to download artifact: %s", resp.Status)
 	}
 
+	download, err := os.Create(filepath.Join(dest, filepath.Base(link)))
+	if err != nil {
+		return "", err
+	}
+	defer download.Close()
+
 	if _, err := io.Copy(download, resp.Body); err != nil {
 		return "", err
 	}
 
 	return download.Name(), nil
+}
+
+// fetchReleasesFromFallback calls the caching proxy's list endpoint and
+// unmarshals the response into GitHub RepositoryRelease objects.
+func fetchReleasesFromFallback(timeout time.Duration) ([]*github.RepositoryRelease, error) {
+	c := &http.Client{Timeout: timeout}
+	resp, err := c.Get(fallbackBaseURL + "?action=list")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fallback list failed: %s", resp.Status)
+	}
+
+	var releases []*github.RepositoryRelease
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		return nil, fmt.Errorf("fallback list decode: %w", err)
+	}
+
+	return releases, nil
+}
+
+// getFallbackDownloadURL parses a GitHub release asset URL to extract the tag
+// and asset name, then asks the caching proxy for a signed download URL.
+func getFallbackDownloadURL(link string, timeout time.Duration) (string, error) {
+	// GitHub asset URLs look like:
+	//   https://github.com/speakeasy-api/speakeasy/releases/download/v1.2.3/speakeasy_linux_amd64.zip
+	u, err := url.Parse(link)
+	if err != nil {
+		return "", err
+	}
+
+	parts := strings.Split(u.Path, "/")
+	// Expected: ["", "speakeasy-api", "speakeasy", "releases", "download", "v1.2.3", "asset.zip"]
+	if len(parts) < 7 {
+		return "", fmt.Errorf("unexpected GitHub asset URL format: %s", link)
+	}
+	tag := parts[len(parts)-2]
+	asset := parts[len(parts)-1]
+
+	c := &http.Client{Timeout: timeout}
+	reqURL := fmt.Sprintf("%s?action=download&tag=%s&asset=%s", fallbackBaseURL, url.QueryEscape(tag), url.QueryEscape(asset))
+	resp, err := c.Get(reqURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fallback download failed: %s", resp.Status)
+	}
+
+	var dr fallbackDownloadResponse
+	if err := json.NewDecoder(resp.Body).Decode(&dr); err != nil {
+		return "", fmt.Errorf("fallback download decode: %w", err)
+	}
+
+	if dr.URL == "" {
+		return "", fmt.Errorf("fallback returned empty download URL")
+	}
+
+	return dr.URL, nil
 }
 
 func extract(archive, dest string) error {
@@ -396,7 +515,7 @@ func extractZip(archive, dest string) error {
 	if err != nil {
 		return err
 	}
-	defer z.Close()
+	defer func() { _ = z.Close() }()
 
 	for _, file := range z.File {
 		filePath := filepath.Join(dest, file.Name)

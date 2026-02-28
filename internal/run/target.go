@@ -3,10 +3,12 @@ package run
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/hashicorp/go-version"
+	"github.com/speakeasy-api/openapi-generation/v2/pkg/generate"
 	sdkGenConfig "github.com/speakeasy-api/sdk-gen-config"
 	"github.com/speakeasy-api/sdk-gen-config/workflow"
 	"github.com/speakeasy-api/speakeasy-core/auth"
@@ -21,6 +23,7 @@ import (
 	"github.com/speakeasy-api/speakeasy/internal/git"
 	"github.com/speakeasy-api/speakeasy/internal/links"
 	"github.com/speakeasy-api/speakeasy/internal/log"
+	"github.com/speakeasy-api/speakeasy/internal/sdkchangelog"
 	"github.com/speakeasy-api/speakeasy/internal/sdkgen"
 	"github.com/speakeasy-api/speakeasy/internal/utils"
 	"github.com/speakeasy-api/speakeasy/internal/validation"
@@ -48,7 +51,18 @@ func (w *Workflow) runTarget(ctx context.Context, target string) (*SourceResult,
 	rootStep := w.RootStep.NewSubstep(fmt.Sprintf("Target: %s", target))
 
 	t := w.workflow.Targets[target]
+	targetLanguage := t.Target
 	targetLock := workflow.TargetLock{Source: t.Source}
+
+	// Set the previous revision digest from the old lockfile for SDK changelog diffing
+	if w.lockfileOld != nil {
+		if oldTargetLock, ok := w.lockfileOld.Targets[target]; ok && oldTargetLock.SourceRevisionDigest != "" {
+			cliEvent := events.GetTelemetryEventFromContext(ctx)
+			if cliEvent != nil {
+				cliEvent.GenerateGenLockPreRevisionDigest = &oldTargetLock.SourceRevisionDigest
+			}
+		}
+	}
 
 	log.From(ctx).Infof("Running target %s (%s)...\n", target, t.Target)
 
@@ -60,7 +74,7 @@ func (w *Workflow) runTarget(ctx context.Context, target string) (*SourceResult,
 	var sourceRes *SourceResult
 
 	if source != nil {
-		sourcePath, sourceRes, err = w.RunSource(ctx, rootStep, t.Source, target)
+		sourcePath, sourceRes, err = w.RunSource(ctx, rootStep, t.Source, target, targetLanguage)
 		if err != nil {
 			if w.FromQuickstart && sourceRes != nil && sourceRes.LintResult != nil && len(sourceRes.LintResult.ValidOperations) > 0 {
 				cliEvent := events.GetTelemetryEventFromContext(ctx)
@@ -69,7 +83,7 @@ func (w *Workflow) runTarget(ctx context.Context, target string) (*SourceResult,
 					*cliEvent.GenerateNumberOfOperationsIgnored = int64(len(sourceRes.LintResult.InvalidOperations))
 				}
 
-				retriedPath, retriedRes, retriedErr := w.retryWithMinimumViableSpec(ctx, rootStep, t.Source, target, sourceRes.LintResult.AllErrors)
+				retriedPath, retriedRes, retriedErr := w.retryWithMinimumViableSpec(ctx, rootStep, t.Source, target, sourceRes.LintResult)
 				if retriedErr != nil {
 					log.From(ctx).Errorf("Failed to retry with minimum viable spec: %s", retriedErr)
 					// return the original error
@@ -84,7 +98,7 @@ func (w *Workflow) runTarget(ctx context.Context, target string) (*SourceResult,
 			}
 		}
 	} else {
-		res, err := w.validateDocument(ctx, rootStep, t.Source, sourcePath, "speakeasy-generation", w.ProjectDir)
+		res, err := w.validateDocument(ctx, rootStep, t.Source, sourcePath, "speakeasy-generation", w.ProjectDir, targetLanguage)
 		if err != nil {
 			return sourceRes, nil, err
 		}
@@ -139,54 +153,109 @@ func (w *Workflow) runTarget(ctx context.Context, target string) (*SourceResult,
 
 	err = validation.ValidateConfigAndPrintErrors(ctx, t.Target, genConfig, published, target)
 	if err != nil {
-		if errors.Is(err, validation.NoConfigFound) {
+		if errors.Is(err, validation.ErrNoConfigFound) {
 			genYamlStep.Skip("gen.yaml not found, assuming new SDK")
 		} else {
 			return sourceRes, nil, err
 		}
 	}
 
-	genStep := rootStep.NewSubstep(fmt.Sprintf("Generating %s SDK", utils.CapitalizeFirst(t.Target)))
-
 	logListener := make(chan log.Msg)
 	logger := log.From(ctx).WithListener(logListener)
 	ctx = log.With(ctx, logger)
+
+	if w.StreamableGeneration != nil && w.Debug {
+		w.StreamableGeneration.LogListener = logListener
+	}
+
+	if w.CancellableGeneration != nil {
+		cancelCtx, cancelFunc := context.WithCancel(ctx)
+		w.CancellableGeneration.CancellationMutex.Lock()
+		w.CancellableGeneration.CancellableContext = cancelCtx
+		w.CancellableGeneration.CancelGeneration = cancelFunc
+		w.CancellableGeneration.CancellationMutex.Unlock()
+
+		defer func() {
+			w.CancellableGeneration.CancellationMutex.Lock()
+			w.CancellableGeneration.CancelGeneration = nil
+			w.CancellableGeneration.CancellableContext = nil
+			w.CancellableGeneration.CancellationMutex.Unlock()
+			cancelFunc() // Ensure context is cleaned up
+		}()
+	}
+
+	changelogContent := ""
+	if os.Getenv("INPUT_ENABLE_SDK_CHANGELOG") == "true" {
+		// Old & new spec and other details are updated in RunSource method
+		log.From(ctx).Infof("Calculating changelog for SDK %s SDK", utils.CapitalizeFirst(t.Target))
+		result, changelogErr := sdkchangelog.ComputeAndStoreSDKChangelog(ctx, sdkchangelog.Requirements{
+			OldSpecPath:  w.SourceResults[t.Source].oldSpecPath,
+			NewSpecPath:  w.SourceResults[t.Source].newSpecPath,
+			OutDir:       outDir,
+			ProjectDir:   w.ProjectDir,
+			Lang:         t.Target,
+			Verbose:      w.Verbose,
+			Target:       target,
+			WorkflowStep: rootStep,
+		})
+		changelogContent = result.MarkdownContent
+		if changelogContent == "" {
+			log.From(ctx).Warnf("New Changelog Content was empty for %s SDK. As a result it will not appear in the PR description", utils.CapitalizeFirst(t.Target))
+		}
+		if changelogErr != nil {
+			// Dont error out so that we don't block generation
+			log.From(ctx).Warnf("Error computing SDK changelog: %s", changelogErr.Error())
+		}
+		log.From(ctx).Infof("Calculating changelog for SDK %s SDK succeeded", utils.CapitalizeFirst(t.Target))
+	} else {
+		log.From(ctx).Infof("New SDK changelog is disabled for SDK %s SDK", utils.CapitalizeFirst(t.Target))
+	}
+
+	genStep := rootStep.NewSubstep(fmt.Sprintf("Generating %s SDK", utils.CapitalizeFirst(t.Target)))
 	go genStep.ListenForSubsteps(logListener)
 
 	generationAccess, err := sdkgen.Generate(
 		ctx,
 		sdkgen.GenerateOptions{
-			CustomerID:      config.GetCustomerID(),
-			WorkspaceID:     config.GetWorkspaceID(),
-			Language:        t.Target,
-			SchemaPath:      sourcePath,
-			Header:          "",
-			Token:           "",
-			OutDir:          outDir,
-			CLIVersion:      events.GetSpeakeasyVersionFromContext(ctx),
-			InstallationURL: w.InstallationURLs[target],
-			Debug:           w.Debug,
-			AutoYes:         true,
-			Published:       published,
-			OutputTests:     false,
-			Repo:            w.Repo,
-			RepoSubDir:      w.RepoSubDirs[target],
-			Verbose:         w.Verbose,
-			Compile:         w.ShouldCompile,
-			TargetName:      target,
-			SkipVersioning:  w.SkipVersioning,
+			CustomerID:            config.GetCustomerID(),
+			WorkspaceID:           config.GetWorkspaceID(),
+			Language:              t.Target,
+			SchemaPath:            sourcePath,
+			Header:                "",
+			Token:                 "",
+			OutDir:                outDir,
+			CLIVersion:            events.GetSpeakeasyVersionFromContext(ctx),
+			InstallationURL:       w.InstallationURLs[target],
+			Debug:                 w.Debug,
+			AutoYes:               w.AutoYes,
+			Published:             published,
+			OutputTests:           false,
+			Repo:                  w.Repo,
+			RepoSubDir:            w.RepoSubDirs[target],
+			Verbose:               w.Verbose,
+			Compile:               w.ShouldCompile,
+			TargetName:            target,
+			SkipVersioning:        w.SkipVersioning,
+			AllowPrompts:          w.AllowPrompts,
+			CancellableGeneration: w.CancellableGeneration,
+			StreamableGeneration:  w.StreamableGeneration,
+			ReleaseNotes:          changelogContent,
+			WorkflowStep:          genStep,
+			RenderUsageSnippets:   t.CodeSamplesEnabled(),
 		},
 	)
-
 	if err != nil {
 		return sourceRes, nil, err
 	}
 	w.generationAccess = generationAccess
 
-	if t.CodeSamples != nil {
-		codeSamplesStep := rootStep.NewSubstep("Generating Code Samples")
-		namespaceName, digest, err := w.runCodeSamples(ctx, codeSamplesStep, *t.CodeSamples, t.Target, sourcePath, t.Output)
+	if !w.ShouldCompile {
+		log.From(ctx).Warnf("Compilation was skipped. The generated SDK may not be ready for use without manual compilation. To enable compilation DO NOT pass the --skip-compile flag.")
+	}
 
+	if t.CodeSamplesEnabled() {
+		codeSamplesStep := rootStep.NewSubstep("Generating Code Samples")
+		namespaceName, digest, err := w.runCodeSamples(ctx, codeSamplesStep, *t.CodeSamples, t.Target, sourcePath, t.Output, generationAccess.RenderedUsageSnippets)
 		if err != nil {
 			// Block by default. Only warn if explicitly set to non-blocking
 			if t.CodeSamples.Blocking == nil || *t.CodeSamples.Blocking {
@@ -201,13 +270,13 @@ func (w *Workflow) runTarget(ctx context.Context, target string) (*SourceResult,
 		targetLock.CodeSamplesRevisionDigest = digest
 	}
 
-	if targetEnablesTesting(t) {
+	if targetEnablesTesting(ctx, t) {
 		testingStep := rootStep.NewSubstep(fmt.Sprintf("Running %s Testing", utils.CapitalizeFirst(t.Target)))
 
 		if w.SkipTesting {
 			testingStep.Skip("explicitly disabled")
 		} else if err := w.runTesting(ctx, target, t, testingStep, outDir); err != nil {
-			return sourceRes, nil, err
+			return sourceRes, nil, ErrNoRollback.Wrap(err)
 		}
 	}
 
@@ -231,18 +300,30 @@ func (w *Workflow) runTarget(ctx context.Context, target string) (*SourceResult,
 	return sourceRes, &targetResult, nil
 }
 
-// Returns codeSamples namespace name and digest
-func (w *Workflow) runCodeSamples(ctx context.Context, codeSamplesStep *workflowTracking.WorkflowStep, codeSamples workflow.CodeSamples, target, sourcePath string, baseOutputPath *string) (string, string, error) {
+// Returns codeSamples namespace name and digest.
+// If preRendered is non-nil with content, it is used to build the overlay directly,
+// avoiding a second AST resolution pass.
+func (w *Workflow) runCodeSamples(ctx context.Context, codeSamplesStep *workflowTracking.WorkflowStep, codeSamples workflow.CodeSamples, target, sourcePath string, targetOutputPath *string, preRendered *generate.RenderedUsageSnippets) (string, string, error) {
 	configPath := "."
-	outputPath := codeSamples.Output
+	writeFileLocation := codeSamples.Output
 
-	// If an output path is specified, make sure it's relative to the base output path
-	if baseOutputPath != nil && outputPath != "" {
-		configPath = *baseOutputPath
-		outputPath = filepath.Join(*baseOutputPath, outputPath)
+	if targetOutputPath != nil {
+		// configPath should be relative to the target output path for nested SDKs
+		configPath = *targetOutputPath
+		// If a write file location is specified, make sure it's relative to the target output path
+		if writeFileLocation != "" {
+			writeFileLocation = filepath.Join(*targetOutputPath, writeFileLocation)
+		}
 	}
 
-	overlayString, err := codesamples.GenerateOverlay(ctx, sourcePath, "", "", configPath, outputPath, []string{target}, true, false, codeSamples)
+	var overlayString string
+	var err error
+
+	if preRendered != nil && preRendered.RawOutput != "" {
+		overlayString, err = codesamples.GenerateOverlayFromRawSnippets(ctx, preRendered.RawOutput, target, sourcePath, writeFileLocation, true, codeSamples)
+	} else {
+		overlayString, err = codesamples.GenerateOverlay(ctx, sourcePath, "", "", configPath, writeFileLocation, []string{target}, true, false, codeSamples)
+	}
 	if err != nil {
 		return "", "", err
 	}
@@ -261,7 +342,7 @@ func (w *Workflow) snapshotCodeSamples(ctx context.Context, parentStep *workflow
 		return
 	}
 
-	tags, err := w.getRegistryTags(ctx, "")
+	tags, err := w.getRegistryTags(ctx, "", nil)
 	if err != nil {
 		return
 	}
@@ -291,7 +372,7 @@ func (w *Workflow) snapshotCodeSamples(ctx context.Context, parentStep *workflow
 	memfs := fsextras.NewMemFS()
 
 	overlayPath := "overlay.yaml"
-	err = memfs.WriteBytes(overlayPath, []byte(overlayString), 0644)
+	err = memfs.WriteBytes(overlayPath, []byte(overlayString), 0o644)
 	if err != nil {
 		return "", "", fmt.Errorf("error writing overlay to memfs: %w", err)
 	}
@@ -328,17 +409,13 @@ func (w *Workflow) snapshotCodeSamples(ctx context.Context, parentStep *workflow
 		Annotations: annotations,
 		MediaType:   ocicommon.MediaTypeOpenAPIOverlayV0,
 	})
-
 	if err != nil {
 		return "", "", fmt.Errorf("error bundling code samples artifact: %w", err)
 	}
 
 	serverURL := auth.GetServerURL()
 
-	insecurePublish := false
-	if strings.HasPrefix(serverURL, "http://") {
-		insecurePublish = true
-	}
+	insecurePublish := strings.HasPrefix(serverURL, "http://")
 
 	reg := strings.TrimPrefix(serverURL, "http://")
 	reg = strings.TrimPrefix(reg, "https://")
@@ -383,4 +460,17 @@ func (w *Workflow) printTargetSuccessMessage(ctx context.Context) {
 
 	msg := fmt.Sprintf("%s\n%s\n", styles.Success.Render(heading), strings.Join(additionalLines, "\n"))
 	log.From(ctx).Println(msg)
+}
+
+func (w *Workflow) CancelGeneration() error {
+	if w.CancellableGeneration != nil {
+		w.CancellableGeneration.CancellationMutex.Lock()
+		defer w.CancellableGeneration.CancellationMutex.Unlock()
+		if w.CancellableGeneration.CancelGeneration != nil {
+			w.CancellableGeneration.CancelGeneration()
+			return nil
+		}
+	}
+
+	return fmt.Errorf("generation is not cancellable")
 }

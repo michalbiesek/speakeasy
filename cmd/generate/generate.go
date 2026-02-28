@@ -19,17 +19,8 @@ import (
 	"github.com/speakeasy-api/openapi-generation/v2/pkg/generate"
 )
 
-func SDKSupportedLanguageTargets() []string {
-	languages := make([]string, 0)
-	for _, lang := range generate.GetSupportedLanguages() {
-		if lang == "docs" {
-			continue
-		}
-
-		languages = append(languages, lang)
-	}
-
-	return languages
+func GeneratorSupportedTargetNames() []string {
+	return generate.GetSupportedTargetNames()
 }
 
 var (
@@ -79,9 +70,14 @@ var (
 )
 
 var GenerateCmd = &model.CommandGroup{
-	Usage:          "generate",
-	Short:          "One off Generations for client SDKs and more",
-	Long:           `The "generate" command provides a set of commands for one off generations of client SDKs and Terraform providers`,
+	Usage: "generate",
+	Short: "One-off generation (prefer 'speakeasy run' with workflow files)",
+	Long: `The "generate" command provides commands for one-off generation of client SDKs and Terraform providers.
+
+NOTE: For project-based SDK generation, use "speakeasy run" with a .speakeasy/workflow.yaml file instead.
+Workflow files provide reproducible, versioned builds with support for multiple targets and CI/CD integration.
+
+AI Agents: run "speakeasy agent context" for structured documentation before generating.`,
 	InteractiveMsg: "What do you want to generate?",
 	Commands:       []model.Command{genSDKCmd, genUsageSnippetCmd, codeSamplesCmd, genSDKVersionCmd, genSDKChangelogCmd, suportedTargetsCmd},
 	Hidden:         true,
@@ -157,7 +153,7 @@ func getLatestVersionInfo(ctx context.Context, flags GenerateSDKVersionFlags) er
 
 	lang := flags.Language
 	if lang != "" {
-		if !slices.Contains(generate.GetSupportedLanguages(), lang) {
+		if !slices.Contains(generate.GetSupportedTargetNames(), lang) {
 			return fmt.Errorf("unsupported language %s", lang)
 		}
 
@@ -166,14 +162,14 @@ func getLatestVersionInfo(ctx context.Context, flags GenerateSDKVersionFlags) er
 			return fmt.Errorf("failed to get latest versions for language %s: %w", lang, err)
 		}
 
-		logger.Printf("Features:")
+		logger.Print("Features:")
 
 		for feature, version := range latestVersions {
 			logger.Printf("  %s: %s", feature, version)
 		}
 
 		if len(latestVersions) > 0 {
-			logger.Printf("\n")
+			logger.Print("\n")
 		}
 
 		changeLog, err = changelogs.GetChangeLog(lang, latestVersions, nil)
@@ -184,7 +180,7 @@ func getLatestVersionInfo(ctx context.Context, flags GenerateSDKVersionFlags) er
 		changeLog = changelog.GetChangeLog(changelog.WithSpecificVersion(version))
 	}
 
-	logger.Printf(string(markdown.Render("# CHANGELOG\n\n"+changeLog, 100, 0)))
+	logger.Print(string(markdown.Render("# CHANGELOG\n\n"+changeLog, 100, 0)))
 
 	return nil
 }
@@ -199,11 +195,11 @@ func getChangelogs(ctx context.Context, flags GenerateSDKChangelogFlags) error {
 
 	lang := flags.Language
 	if lang != "" {
-		if !slices.Contains(generate.GetSupportedLanguages(), lang) {
+		if !slices.Contains(generate.GetSupportedTargetNames(), lang) {
 			return fmt.Errorf("unsupported language %s", lang)
 		}
 
-		targetVersions := map[string]string{}
+		var targetVersions map[string]string
 
 		if flags.TargetVersion == "" {
 			targetVersions, err = changelogs.GetLatestVersions(lang)
@@ -211,21 +207,13 @@ func getChangelogs(ctx context.Context, flags GenerateSDKChangelogFlags) error {
 				return err
 			}
 		} else {
-			pairs := strings.Split(flags.TargetVersion, ",")
-			for i := 0; i < len(pairs); i += 2 {
-				targetVersions[pairs[i]] = pairs[i+1]
-			}
+			targetVersions = parseVersionPairs(ctx, flags.TargetVersion)
 		}
 
 		var previousVersions map[string]string
 
 		if flags.PreviousVersion != "" {
-			previousVersions = map[string]string{}
-
-			pairs := strings.Split(flags.PreviousVersion, ",")
-			for i := 0; i < len(pairs); i += 2 {
-				previousVersions[pairs[i]] = pairs[i+1]
-			}
+			previousVersions = parseVersionPairs(ctx, flags.PreviousVersion)
 		}
 
 		changeLog, err = changelogs.GetChangeLog(lang, targetVersions, previousVersions)
@@ -233,15 +221,16 @@ func getChangelogs(ctx context.Context, flags GenerateSDKChangelogFlags) error {
 			return fmt.Errorf("failed to get changelog for language %s: %w", lang, err)
 		}
 	} else {
-		if flags.TargetVersion != "" {
+		switch {
+		case flags.TargetVersion != "":
 			opts = append(opts, changelog.WithTargetVersion(flags.TargetVersion))
 
 			if flags.PreviousVersion != "" {
 				opts = append(opts, changelog.WithPreviousVersion(flags.PreviousVersion))
 			}
-		} else if flags.SpecificVersion != "" {
+		case flags.SpecificVersion != "":
 			opts = append(opts, changelog.WithSpecificVersion(flags.SpecificVersion))
-		} else {
+		default:
 			opts = append(opts, changelog.WithSpecificVersion(changelog.GetLatestVersion()))
 		}
 
@@ -251,10 +240,33 @@ func getChangelogs(ctx context.Context, flags GenerateSDKChangelogFlags) error {
 	logger := log.From(ctx)
 
 	if raw {
-		logger.Printf(changeLog)
+		logger.Print(changeLog)
 		return nil
 	}
 
-	logger.Printf(string(markdown.Render("# CHANGELOG\n\n"+changeLog, 100, 0)))
+	logger.Print(string(markdown.Render("# CHANGELOG\n\n"+changeLog, 100, 0)))
 	return nil
+}
+
+// parseVersionPairs parses a comma-separated string of key,value pairs into a map.
+// For example: "feature1,1.0.0,feature2,2.0.0" becomes {"feature1": "1.0.0", "feature2": "2.0.0"}.
+// If the input has an odd number of elements, the trailing key without a value is ignored.
+func parseVersionPairs(ctx context.Context, input string) map[string]string {
+	if input == "" {
+		return make(map[string]string)
+	}
+
+	pairs := strings.Split(input, ",")
+
+	if len(pairs)%2 != 0 {
+		log.From(ctx).Warnf("version pairs has mismatched key %q: %v", pairs[len(pairs)-1], pairs)
+	}
+
+	result := make(map[string]string, len(pairs)/2)
+
+	for i := 0; i < len(pairs)-1; i += 2 {
+		result[pairs[i]] = pairs[i+1]
+	}
+
+	return result
 }

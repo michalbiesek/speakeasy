@@ -1,19 +1,19 @@
 package overlay
 
 import (
-	"github.com/stretchr/testify/require"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
 	schemaFile               = "testdata/base.yaml"
-	schemaJSON    = "testdata/base.json"
-	overlayFileV1 = "testdata/overlay.yaml"
-	overlayFileV2 = "testdata/overlay-v2.yaml"
+	schemaJSON               = "testdata/base.json"
+	overlayFileV1            = "testdata/overlay.yaml"
+	overlayFileV2            = "testdata/overlay-v2.yaml"
 	overlayStrictFailure     = "testdata/strict-failure.yaml"
 	expectedFile             = "testdata/expected.yaml"
 	expectedFileJSON         = "testdata/expected.json"
@@ -21,61 +21,81 @@ const (
 )
 
 func TestApply_inYAML_outYAML(t *testing.T) {
+	t.Parallel()
+
 	test(t, schemaFile, overlayFileV1, expectedFile, true)
 }
 
 func TestApply_inJSON_outJSON(t *testing.T) {
+	t.Parallel()
+
 	test(t, schemaJSON, overlayFileV1, expectedFileJSON, false)
 }
 
 func TestApply_inYAML_outJSON(t *testing.T) {
+	t.Parallel()
+
 	test(t, schemaFile, overlayFileV1, expectedFileJSON, false)
 }
 
 func TestApply_inJSON_outYAML(t *testing.T) {
+	t.Parallel()
+
 	test(t, schemaJSON, overlayFileV1, expectedFileYAMLFromJSON, true)
 }
 
 func TestApply_inYAML_outYAML_v2(t *testing.T) {
+	t.Parallel()
+
 	test(t, schemaFile, overlayFileV2, expectedFile, true)
 }
 
 func TestApply_inJSON_outJSON_v2(t *testing.T) {
+	t.Parallel()
+
 	test(t, schemaJSON, overlayFileV2, expectedFileJSON, false)
 }
 
 func TestApply_inYAML_outJSON_v2(t *testing.T) {
+	t.Parallel()
+
 	test(t, schemaFile, overlayFileV2, expectedFileJSON, false)
 }
 
 func TestApply_inJSON_outYAML_v2(t *testing.T) {
+	t.Parallel()
+
 	test(t, schemaJSON, overlayFileV2, expectedFileYAMLFromJSON, true)
 }
 
 func TestApply_StrictFailure(t *testing.T) {
-	tmpFile, err := os.CreateTemp("", "output.yaml")
+	t.Parallel()
+
+	tmpFile, err := os.CreateTemp(t.TempDir(), "output.yaml")
 	require.NoError(t, err)
+	defer tmpFile.Close()
 	_, err = Apply(schemaFile, overlayStrictFailure, true, tmpFile, true, true)
 	assert.Errorf(t, err, "unknown-element")
 }
 
 func test(t *testing.T, schemaFile string, overlayFile string, expectedFile string, yamlOut bool) {
+	t.Helper()
 	ext := "json"
 	if yamlOut {
 		ext = "yaml"
 	}
-	tmpFile, err := os.CreateTemp("", "output."+ext)
+	tmpFile, err := os.CreateTemp(t.TempDir(), "output."+ext)
 	require.NoError(t, err)
 	defer tmpFile.Close()
 
 	_, err = Apply(schemaFile, overlayFile, yamlOut, tmpFile, true, false)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	expectedContent, err := os.ReadFile(expectedFile)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	actualContent, err := os.ReadFile(tmpFile.Name())
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	println(string(actualContent))
 

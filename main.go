@@ -1,9 +1,11 @@
 package main
 
 import (
+	"runtime"
+
+	"github.com/KimMachineGun/automemlimit/memlimit"
 	"github.com/speakeasy-api/speakeasy/cmd"
 	"github.com/speakeasy-api/speakeasy/internal/env"
-	"runtime"
 )
 
 var (
@@ -12,6 +14,8 @@ var (
 )
 
 func main() {
+	_, _ = memlimit.SetGoMemLimitWithOpts()
+
 	if env.IsLocalDev() {
 		if env.GoArch() != "" {
 			artifactArch = env.GoArch()

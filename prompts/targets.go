@@ -3,8 +3,6 @@ package prompts
 import (
 	"context"
 	"fmt"
-	"github.com/speakeasy-api/speakeasy/internal/charm/styles"
-	"github.com/speakeasy-api/speakeasy/internal/log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,19 +12,22 @@ import (
 	"github.com/speakeasy-api/openapi-generation/v2/pkg/generate"
 	"github.com/speakeasy-api/sdk-gen-config/workflow"
 	"github.com/speakeasy-api/speakeasy/internal/charm"
+	"github.com/speakeasy-api/speakeasy/internal/charm/styles"
+	"github.com/speakeasy-api/speakeasy/internal/log"
 	"github.com/speakeasy-api/speakeasy/internal/utils"
 )
 
-const TargetNameDefault = "my-first-target"
+const (
+	TargetNameDefault = "my-first-target"
 
-func getBaseTargetPrompts(currentWorkflow *workflow.Workflow, sourceName, targetName, targetType, outDir *string, newTarget bool) []*huh.Group {
+	targetGroupMCP       = "mcp"
+	targetGroupSDK       = "sdk"
+	targetGroupTerraform = "terraform"
+)
+
+func getBaseTargetPrompts(currentWorkflow *workflow.Workflow, sourceName, targetName, outDir *string, newTarget bool) []*huh.Group {
+	groups := []*huh.Group{}
 	targetFields := []huh.Field{}
-	if newTarget {
-		targetFields = append(targetFields, huh.NewSelect[string]().
-			Title("Which language would you like to generate?").
-			Options(GetTargetOptions()...).
-			Value(targetType))
-	}
 
 	if !newTarget || targetName == nil || *targetName == "" {
 		originalTargetName := ""
@@ -55,9 +56,10 @@ func getBaseTargetPrompts(currentWorkflow *workflow.Workflow, sourceName, target
 	}
 
 	targetFields = append(targetFields, rendersSelectSource(currentWorkflow, sourceName)...)
-	groups := []*huh.Group{
-		huh.NewGroup(targetFields...),
+	if len(targetFields) > 0 {
+		groups = append(groups, huh.NewGroup(targetFields...))
 	}
+
 	if len(currentWorkflow.Targets) > 0 {
 		groups = append(groups,
 			huh.NewGroup(charm.NewInlineInput(outDir).
@@ -95,12 +97,26 @@ func targetBaseForm(ctx context.Context, quickstart *Quickstart) (*QuickstartSta
 		targetType = *quickstart.Defaults.TargetType
 	}
 
-	targetName, target, err := PromptForNewTarget(quickstart.WorkflowFile, targetName, targetType, "")
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create new target")
+	var target *workflow.Target
+
+	// Check if we have a default target type from hidden flags or use prompts
+	if quickstart.Defaults.TargetType != nil && *quickstart.Defaults.TargetType != "" {
+		// Use the target type that was already set (e.g., from --target flag)
+		sourceName := getSourcesFromWorkflow(quickstart.WorkflowFile)[0]
+		target = &workflow.Target{
+			Target: targetType,
+			Source: sourceName,
+		}
+	} else {
+		updatedTargetName, targetPtr, err := PromptForNewTarget(quickstart.WorkflowFile, targetName, targetType, "")
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create new target")
+		}
+		targetName = updatedTargetName
+		target = targetPtr
 	}
 
-	if err := target.Validate(generate.GetSupportedLanguages(), quickstart.WorkflowFile.Sources); err != nil {
+	if err := target.Validate(generate.GetSupportedTargetNames(), quickstart.WorkflowFile.Sources); err != nil {
 		return nil, errors.Wrap(err, "failed to validate target")
 	}
 
@@ -123,12 +139,72 @@ func targetBaseForm(ctx context.Context, quickstart *Quickstart) (*QuickstartSta
 
 func PromptForNewTarget(currentWorkflow *workflow.Workflow, targetName, targetType, outDir string) (string, *workflow.Target, error) {
 	sourceName := getSourcesFromWorkflow(currentWorkflow)[0]
-	prompts := getBaseTargetPrompts(currentWorkflow, &sourceName, &targetName, &targetType, &outDir, true)
-	if _, err := charm.NewForm(huh.NewForm(prompts...),
+
+	// Execute first form: Target group selection
+	targetGroup := new(string)
+	targetGroupForm := huh.NewForm(huh.NewGroup(huh.NewSelect[string]().
+		Title("What would you like to generate?").
+		Options([]huh.Option[string]{
+			huh.NewOption("Software Development Kit (SDK)", targetGroupSDK),
+			huh.NewOption("Terraform Provider", targetGroupTerraform),
+			huh.NewOption("Model Context Protocol (MCP) Server", targetGroupMCP),
+		}...).
+		Value(targetGroup)))
+
+	if _, err := charm.NewForm(targetGroupForm,
 		charm.WithTitle("Let's set up a new target for your workflow."),
 		charm.WithDescription("A target defines what language to generate and how.")).
 		ExecuteForm(); err != nil {
 		return "", nil, err
+	}
+
+	// Execute second form: Specific target type selection
+	targetSelectionForm := huh.NewForm(huh.NewGroup(huh.NewSelect[string]().
+		Title(func() string {
+			switch *targetGroup {
+			case targetGroupMCP:
+				return "Which MCP Server would you like to generate?"
+			case targetGroupSDK:
+				return "Which SDK language would you like to generate?"
+			case targetGroupTerraform:
+				return "Which Terraform Provider would you like to generate?"
+			default:
+				return "Select target type"
+			}
+		}()).
+		Options(func() []huh.Option[string] {
+			switch *targetGroup {
+			case targetGroupMCP:
+				return getMCPTargetOptions()
+			case targetGroupSDK:
+				return getSDKTargetOptions()
+			case targetGroupTerraform:
+				return getTerraformTargetOptions()
+			default:
+				return []huh.Option[string]{}
+			}
+		}()...).
+		Value(&targetType)))
+
+	if _, err := charm.NewForm(targetSelectionForm,
+		charm.WithTitle("Select your target type"),
+		charm.WithDescription("Choose the specific implementation you'd like to generate.")).
+		ExecuteForm(); err != nil {
+		return "", nil, err
+	}
+
+	remainingPrompts := getBaseTargetPrompts(currentWorkflow, &sourceName, &targetName, &outDir, true)
+
+	// If there are any additional prompts needed to configure the target, show these.
+	if len(remainingPrompts) > 0 {
+		targetConfigurationForm := huh.NewForm(remainingPrompts...)
+
+		if _, err := charm.NewForm(targetConfigurationForm,
+			charm.WithTitle("Complete your target configuration"),
+			charm.WithDescription("Provide additional details for your target.")).
+			ExecuteForm(); err != nil {
+			return "", nil, err
+		}
 	}
 
 	target := workflow.Target{
@@ -139,7 +215,7 @@ func PromptForNewTarget(currentWorkflow *workflow.Workflow, targetName, targetTy
 		target.Output = &outDir
 	}
 
-	if err := target.Validate(generate.GetSupportedLanguages(), currentWorkflow.Sources); err != nil {
+	if err := target.Validate(generate.GetSupportedTargetNames(), currentWorkflow.Sources); err != nil {
 		return "", nil, errors.Wrap(err, "failed to validate target")
 	}
 
@@ -147,7 +223,7 @@ func PromptForNewTarget(currentWorkflow *workflow.Workflow, targetName, targetTy
 }
 
 func PromptForExistingTarget(currentWorkflow *workflow.Workflow, targetName string) (string, *workflow.Target, error) {
-	target, _ := currentWorkflow.Targets[targetName]
+	target := currentWorkflow.Targets[targetName]
 	sourceName := target.Source
 	targetType := target.Target
 	outDir := ""
@@ -156,7 +232,7 @@ func PromptForExistingTarget(currentWorkflow *workflow.Workflow, targetName stri
 	}
 	originalDir := outDir
 
-	prompts := getBaseTargetPrompts(currentWorkflow, &sourceName, &targetName, &targetType, &outDir, false)
+	prompts := getBaseTargetPrompts(currentWorkflow, &sourceName, &targetName, &outDir, false)
 	if _, err := charm.NewForm(huh.NewForm(prompts...),
 		charm.WithTitle("Let's set up a new target for your workflow."),
 		charm.WithDescription("A target is a set of workflow instructions and a gen.yaml config that defines what you would like to generate.")).ExecuteForm(); err != nil {
@@ -171,7 +247,7 @@ func PromptForExistingTarget(currentWorkflow *workflow.Workflow, targetName stri
 		newTarget.Output = &outDir
 	}
 
-	if err := newTarget.Validate(generate.GetSupportedLanguages(), currentWorkflow.Sources); err != nil {
+	if err := newTarget.Validate(generate.GetSupportedTargetNames(), currentWorkflow.Sources); err != nil {
 		return "", nil, errors.Wrap(err, "failed to validate target")
 	}
 

@@ -3,10 +3,15 @@ package auth
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"os"
 
+	"github.com/speakeasy-api/speakeasy-client-sdk-go/v3/pkg/models/operations"
 	core "github.com/speakeasy-api/speakeasy-core/auth"
 	"github.com/speakeasy-api/speakeasy/internal/config"
+	"github.com/speakeasy-api/speakeasy/internal/interactivity"
 	"github.com/speakeasy-api/speakeasy/internal/log"
+	"github.com/speakeasy-api/speakeasy/internal/sdk"
 )
 
 func Authenticate(ctx context.Context, force bool) (context.Context, error) {
@@ -35,7 +40,7 @@ func UseExistingAPIKeyIfAvailable(ctx context.Context) (context.Context, error) 
 	if err != nil {
 		return ctx, err
 	}
-	config.SetSpeakeasyAuthInfo(ctx, core.SpeakeasyAuthInfo{
+	_ = config.SetSpeakeasyAuthInfo(ctx, core.SpeakeasyAuthInfo{
 		APIKey:      existingApiKey,
 		WorkspaceID: workspaceID,
 	})
@@ -51,6 +56,73 @@ func Logout(ctx context.Context) error {
 	log.From(ctx).
 		WithInteractiveOnly().
 		Success("Logout successful!")
+
+	return nil
+}
+
+func ConfirmWorkspace(ctx context.Context) error {
+	confirmEnv := os.Getenv("SPEAKEASY_CONFIRM_WORKSPACE")
+	if confirmEnv == "" {
+		return nil
+	}
+
+	workspaceID, err := core.GetWorkspaceIDFromContext(ctx)
+	if err != nil {
+		return nil //nolint:nilerr // Ignore error
+	}
+
+	client, err := sdk.InitSDK()
+	if err != nil {
+		return nil //nolint:nilerr // Ignore error
+	}
+
+	wsReq := operations.GetWorkspaceRequest{
+		WorkspaceID: &workspaceID,
+	}
+
+	wsRes, err := client.Workspaces.GetByID(ctx, wsReq)
+	if err != nil {
+		return nil //nolint:nilerr // Ignore error
+	}
+
+	if wsRes.StatusCode != http.StatusOK || wsRes.Workspace == nil {
+		return nil
+	}
+
+	orgReq := operations.GetOrganizationRequest{
+		OrganizationID: wsRes.Workspace.OrganizationID,
+	}
+
+	orgRes, err := client.Organizations.Get(ctx, orgReq)
+	if err != nil {
+		return nil //nolint:nilerr // Ignore error
+	}
+
+	if orgRes.StatusCode != http.StatusOK || orgRes.Organization == nil {
+		return nil
+	}
+
+	workspaceName := wsRes.Workspace.Name
+	if workspaceName == "" {
+		workspaceName = wsRes.Workspace.Slug
+	}
+
+	orgName := orgRes.Organization.Name
+	if orgName == "" {
+		orgName = orgRes.Organization.Slug
+	}
+
+	if workspaceID == "self" || (orgRes.Organization.Internal != nil && *orgRes.Organization.Internal) {
+		log.From(ctx).Info(fmt.Sprintf("Running command in workspace: %s/%s", orgName, workspaceName))
+		return nil
+	}
+
+	message := fmt.Sprintf("You are about to run this command in workspace: %s/%s", orgName, workspaceName)
+	confirmed := interactivity.SimpleConfirm(message, false)
+
+	if !confirmed {
+		return fmt.Errorf("command cancelled by user")
+	}
 
 	return nil
 }

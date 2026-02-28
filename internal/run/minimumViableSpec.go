@@ -3,45 +3,38 @@ package run
 import (
 	"context"
 	"fmt"
-	"github.com/AlekSi/pointer"
-	"github.com/speakeasy-api/openapi-generation/v2/pkg/errors"
+	"strings"
+
+	"github.com/speakeasy-api/openapi/pointer"
 	"github.com/speakeasy-api/sdk-gen-config/workflow"
 	"github.com/speakeasy-api/speakeasy/internal/charm/styles"
 	"github.com/speakeasy-api/speakeasy/internal/studio/modifications"
+	"github.com/speakeasy-api/speakeasy/internal/validation"
 	"github.com/speakeasy-api/speakeasy/internal/workflowTracking"
-	"strings"
 )
 
-func (w *Workflow) retryWithMinimumViableSpec(ctx context.Context, parentStep *workflowTracking.WorkflowStep, sourceID, targetID string, vErrs []error) (string, *SourceResult, error) {
-	var invalidOperations []string
-	for _, err := range vErrs {
-		vErr := errors.GetValidationErr(err)
-		if vErr.Severity == errors.SeverityError {
-			for _, op := range vErr.AffectedOperationIDs {
-				invalidOperations = append(invalidOperations, op)
-			}
-		}
-	}
+func (w *Workflow) retryWithMinimumViableSpec(ctx context.Context, parentStep *workflowTracking.WorkflowStep, sourceID, targetID string, res *validation.ValidationResult) (string, *SourceResult, error) {
+	targetLanguage := w.workflow.Targets[targetID].Target
 
 	substep := parentStep.NewSubstep("Retrying with minimum viable document")
 	source := w.workflow.Sources[sourceID]
 
-	if len(invalidOperations) > 0 {
+	if len(res.InvalidOperations) > 0 {
 		source.Transformations = append(source.Transformations, workflow.Transformation{
 			FilterOperations: &workflow.FilterOperationsOptions{
-				Operations: strings.Join(invalidOperations, ","),
-				Exclude:    pointer.ToBool(true),
+				Operations: strings.Join(res.InvalidOperations, ","),
+				Exclude:    pointer.From(true),
 			},
 		})
 	} else {
 		// Sometimes the document has invalid, unused sections
 		source.Transformations = append(source.Transformations, workflow.Transformation{
-			RemoveUnused: pointer.ToBool(true),
+			RemoveUnused: pointer.From(true),
 		})
 	}
 	w.workflow.Sources[sourceID] = source
 
-	sourcePath, sourceRes, err := w.RunSource(ctx, substep, sourceID, targetID)
+	sourcePath, sourceRes, err := w.RunSource(ctx, substep, sourceID, targetID, targetLanguage)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to re-run source: %w", err)
 	}

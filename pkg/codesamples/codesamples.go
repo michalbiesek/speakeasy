@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/AlekSi/pointer"
-	"github.com/speakeasy-api/openapi-overlay/pkg/overlay"
+	"github.com/speakeasy-api/openapi/overlay"
+	"github.com/speakeasy-api/openapi/pointer"
 	"github.com/speakeasy-api/sdk-gen-config/workflow"
 	"github.com/speakeasy-api/speakeasy-core/yamlutil"
 	"github.com/speakeasy-api/speakeasy/internal/config"
@@ -25,16 +25,22 @@ const (
 	ReadMe
 )
 
-func GenerateOverlay(ctx context.Context, schema, header, token, configPath, overlayFilename string, langs []string, isWorkflow bool, isSilent bool, opts workflow.CodeSamples) (string, error) {
-	targetToCodeSamples := map[string][]usagegen.UsageSnippet{}
-	isJSON := filepath.Ext(schema) == ".json"
+type CodeSampleExampleSource struct {
+	// Map from header/param name to value
+	Params map[string]string
+	// JSON string of the request body
+	RequestBodyJSON string
+}
 
+func GenerateOverlay(ctx context.Context, schema, header, token, configPath, overlayFilename string, langs []string, isWorkflow bool, isSilent bool, opts workflow.CodeSamples) (string, error) {
 	if isSilent {
 		logger := log.From(ctx)
 		var logs bytes.Buffer
 		logCapture := logger.WithWriter(&logs)
 		ctx = log.With(ctx, logCapture)
 	}
+
+	var allSnippets []usagegen.UsageSnippet
 
 	for _, lang := range langs {
 		usageOutput := &bytes.Buffer{}
@@ -52,6 +58,8 @@ func GenerateOverlay(ctx context.Context, schema, header, token, configPath, ove
 			filepath.Join(configPath, "speakeasyusagegen"),
 			true,
 			usageOutput,
+			nil,
+			nil,
 		); err != nil {
 			return "", err
 		}
@@ -63,11 +71,34 @@ func GenerateOverlay(ctx context.Context, schema, header, token, configPath, ove
 			return "", err
 		}
 
-		for _, snippet := range snippets {
-			target := overlay.NewTargetSelector(snippet.Path, snippet.Method)
+		allSnippets = append(allSnippets, snippets...)
+	}
 
-			targetToCodeSamples[target] = append(targetToCodeSamples[target], snippet)
-		}
+	return buildOverlay(allSnippets, schema, langs[0], overlayFilename, isWorkflow, opts)
+}
+
+// GenerateOverlayFromRawSnippets builds a code samples overlay from pre-rendered
+// raw snippet output, bypassing the need to create a new Generator and re-resolve
+// the AST. The rawOutput is expected to contain "// Usage snippet provided for ..."
+// sections as produced by standalone.ts.
+func GenerateOverlayFromRawSnippets(ctx context.Context, rawOutput, lang, schema string, overlayFilename string, isWorkflow bool, opts workflow.CodeSamples) (string, error) {
+	snippets, err := usagegen.ParseUsageOutput(lang, rawOutput)
+	if err != nil {
+		return "", err
+	}
+
+	log.From(ctx).Infof("\nUsing pre-rendered usage snippets for %s\n\n", lang)
+
+	return buildOverlay(snippets, schema, lang, overlayFilename, isWorkflow, opts)
+}
+
+func buildOverlay(snippets []usagegen.UsageSnippet, schema, lang, overlayFilename string, isWorkflow bool, opts workflow.CodeSamples) (string, error) {
+	isJSON := filepath.Ext(schema) == ".json"
+
+	targetToCodeSamples := map[string][]usagegen.UsageSnippet{}
+	for _, snippet := range snippets {
+		target := overlay.NewTargetSelector(snippet.Path, snippet.Method)
+		targetToCodeSamples[target] = append(targetToCodeSamples[target], snippet)
 	}
 
 	var actions []overlay.Action
@@ -93,10 +124,10 @@ func GenerateOverlay(ctx context.Context, schema, header, token, configPath, ove
 	}
 
 	if isWorkflow {
-		title = fmt.Sprintf("CodeSamples overlay for %s target", langs[0])
+		title = fmt.Sprintf("CodeSamples overlay for %s target", lang)
 	}
 
-	overlay := &overlay.Overlay{
+	o := &overlay.Overlay{
 		Version: "1.0.0",
 		Info: overlay.Info{
 			Title:   title,
@@ -106,10 +137,10 @@ func GenerateOverlay(ctx context.Context, schema, header, token, configPath, ove
 	}
 
 	if !isWorkflow {
-		overlay.Extends = extends
+		o.Extends = extends
 	}
 
-	overlayString, err := overlay.ToString()
+	overlayString, err := o.ToString()
 	if err != nil {
 		return "", err
 	}
@@ -129,7 +160,8 @@ func GenerateOverlay(ctx context.Context, schema, header, token, configPath, ove
 	return overlayString, nil
 }
 
-func GenerateUsageSnippet(ctx context.Context, schema, header, token, configPath, lang string, isSilent bool, operationID *string) ([]usagegen.UsageSnippet, error) {
+// GenerateUsageSnippet us used in the Temporal job in SpeakeasyRegistry
+func GenerateUsageSnippet(ctx context.Context, schema, header, token, configPath, lang string, isSilent bool, operationID *string, example *CodeSampleExampleSource) ([]usagegen.UsageSnippet, error) {
 	if isSilent {
 		logger := log.From(ctx)
 		var logs bytes.Buffer
@@ -140,6 +172,16 @@ func GenerateUsageSnippet(ctx context.Context, schema, header, token, configPath
 	specifiedOperation := ""
 	if operationID != nil {
 		specifiedOperation = *operationID
+		println("specifiedOperation", specifiedOperation)
+	}
+
+	exampleParams := map[string]string{}
+	if example != nil {
+		exampleParams = example.Params
+	}
+	var exampleRequestBody *string
+	if example != nil {
+		exampleRequestBody = &example.RequestBodyJSON
 	}
 
 	usageOutput := &bytes.Buffer{}
@@ -154,8 +196,10 @@ func GenerateUsageSnippet(ctx context.Context, schema, header, token, configPath
 		specifiedOperation,
 		"",
 		filepath.Join(configPath, "speakeasyusagegen"),
-		true,
+		specifiedOperation == "",
 		usageOutput,
+		exampleParams,
+		exampleRequestBody,
 	); err != nil {
 		return nil, err
 	}
@@ -170,11 +214,8 @@ func GenerateUsageSnippet(ctx context.Context, schema, header, token, configPath
 }
 
 func getStyle(opts workflow.CodeSamples) CodeSamplesStyle {
-	if opts.Style != nil {
-		switch *opts.Style {
-		case "readme":
-			return ReadMe
-		}
+	if opts.Style != nil && *opts.Style == "readme" {
+		return ReadMe
 	}
 	return Default
 }
@@ -203,7 +244,7 @@ func singleCodeSampleNode(snippet usagegen.UsageSnippet, opts workflow.CodeSampl
 		lang = *opts.LangOverride
 	}
 
-	label := pointer.ToString(snippet.OperationId)
+	label := pointer.From(snippet.OperationId)
 	if opts.LabelOverride != nil {
 		if opts.LabelOverride.Omit != nil {
 			if *opts.LabelOverride.Omit {
@@ -230,12 +271,4 @@ func singleCodeSampleNode(snippet usagegen.UsageSnippet, opts workflow.CodeSampl
 	}
 
 	return builder.NewMultinode(kvs...)
-}
-
-func styleForNode(isJSON bool) yaml.Style {
-	if isJSON {
-		return yaml.DoubleQuotedStyle
-	}
-
-	return 0
 }

@@ -5,42 +5,69 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	utils2 "github.com/speakeasy-api/speakeasy/internal/utils"
 	"os"
 	"reflect"
+	"strings"
+
+	utils2 "github.com/speakeasy-api/speakeasy/internal/utils"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-version"
-	"github.com/pb33f/libopenapi"
-	"github.com/pb33f/libopenapi/datamodel"
-	v3 "github.com/pb33f/libopenapi/datamodel/high/v3"
-	"github.com/pb33f/libopenapi/orderedmap"
-	"github.com/pb33f/libopenapi/utils"
-	"github.com/speakeasy-api/openapi-overlay/pkg/overlay"
+	"github.com/speakeasy-api/openapi/extensions"
+	"github.com/speakeasy-api/openapi/jsonschema/oas3"
+	"github.com/speakeasy-api/openapi/marshaller"
+	"github.com/speakeasy-api/openapi/openapi"
+	"github.com/speakeasy-api/openapi/overlay"
+	"github.com/speakeasy-api/openapi/sequencedmap"
+	"github.com/speakeasy-api/openapi/yml"
 	"github.com/speakeasy-api/speakeasy/internal/log"
 	"github.com/speakeasy-api/speakeasy/internal/validation"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
 
+// MergeOpenAPIDocuments merges multiple OpenAPI documents into a single document.
+// This is the legacy function that maintains backward compatibility.
 func MergeOpenAPIDocuments(ctx context.Context, inFiles []string, outFile, defaultRuleset, workingDir string, skipGenerateLintReport bool) error {
-	inSchemas := make([][]byte, len(inFiles))
-
-	// TODO at some point we prob want to support remote schemas
+	inputs := make([]MergeInput, len(inFiles))
 	for i, inFile := range inFiles {
-		data, err := os.ReadFile(inFile)
+		inputs[i] = MergeInput{Path: inFile}
+	}
+
+	return MergeOpenAPIDocumentsWithNamespaces(ctx, inputs, outFile, MergeOptions{
+		DefaultRuleset:         defaultRuleset,
+		WorkingDir:             workingDir,
+		SkipGenerateLintReport: skipGenerateLintReport,
+		YAMLOutput:             utils2.HasYAMLExt(outFile),
+	})
+}
+
+// MergeOpenAPIDocumentsWithNamespaces merges multiple OpenAPI documents with optional namespace support.
+// When namespaces are provided, schema names are prefixed and x-speakeasy extensions are added.
+func MergeOpenAPIDocumentsWithNamespaces(ctx context.Context, inputs []MergeInput, outFile string, opts MergeOptions) error {
+	// Validate namespace consistency
+	if err := validateNamespaces(inputs); err != nil {
+		return err
+	}
+
+	inSchemas := make([][]byte, len(inputs))
+	namespaces := make([]string, len(inputs))
+
+	for i, input := range inputs {
+		data, err := os.ReadFile(input.Path)
 		if err != nil {
 			return err
 		}
 
-		if err := validate(ctx, inFile, data, defaultRuleset, workingDir, skipGenerateLintReport); err != nil {
-			log.From(ctx).Error(fmt.Sprintf("failed validating spec %s", inFile), zap.Error(err))
+		if err := validate(ctx, input.Path, data, opts.DefaultRuleset, opts.WorkingDir, opts.SkipGenerateLintReport); err != nil {
+			log.From(ctx).Error(fmt.Sprintf("failed validating spec %s", input.Path), zap.Error(err))
 		}
 
 		inSchemas[i] = data
+		namespaces[i] = input.Namespace
 	}
 
-	mergedSchema, err := merge(inSchemas, utils2.HasYAMLExt(outFile))
+	mergedSchema, err := merge(ctx, inSchemas, namespaces, opts.YAMLOutput)
 	if mergedSchema == nil {
 		return err
 	} else if err != nil {
@@ -64,7 +91,7 @@ func validate(ctx context.Context, schemaPath string, schema []byte, defaultRule
 		MaxWarns: 10,
 	}
 
-	res, err := validation.Validate(ctx, logger, schema, schemaPath, limits, false, defaultRuleset, workingDir, false, skipGenerateLintReport)
+	res, err := validation.Validate(ctx, logger, schema, schemaPath, limits, false, defaultRuleset, workingDir, false, skipGenerateLintReport, "")
 	if err != nil {
 		return err
 	}
@@ -78,7 +105,7 @@ func validate(ctx context.Context, schemaPath string, schema []byte, defaultRule
 
 	if len(res.Errors) > 0 {
 		status := "\nOpenAPI spec invalid ✖"
-		return fmt.Errorf(status)
+		return errors.New(status)
 	}
 
 	log.From(ctx).Success(fmt.Sprintf("Successfully validated %s", schemaPath))
@@ -86,23 +113,65 @@ func validate(ctx context.Context, schemaPath string, schema []byte, defaultRule
 	return nil
 }
 
-func merge(inSchemas [][]byte, yamlOut bool) ([]byte, error) {
-	var mergedDoc *v3.Document
-	var warnings []error
+func merge(ctx context.Context, inSchemas [][]byte, namespaces []string, yamlOut bool) ([]byte, error) {
+	// Validate namespace consistency
+	if err := validateNamespaceSlice(namespaces, len(inSchemas)); err != nil {
+		return nil, err
+	}
 
-	for _, schema := range inSchemas {
-		doc, err := loadOpenAPIDocument(schema)
+	var mergedDoc *openapi.OpenAPI
+	var warnings []error
+	state := newMergeState()
+
+	for i, schema := range inSchemas {
+		doc, err := loadOpenAPIDocument(ctx, schema)
 		if err != nil {
 			return nil, err
 		}
 
+		// Apply namespace if provided
+		namespace := ""
+		if i < len(namespaces) {
+			namespace = namespaces[i]
+		}
+
+		if namespace != "" {
+			// Apply namespace prefixes to all component types
+			schemaMappings := applyNamespaceToSchemas(doc, namespace)
+			paramMappings := applyNamespaceToParameters(doc, namespace)
+			responseMappings := applyNamespaceToResponses(doc, namespace)
+			requestBodyMappings := applyNamespaceToRequestBodies(doc, namespace)
+			headerMappings := applyNamespaceToHeaders(doc, namespace)
+			secSchemeMappings := applyNamespaceToSecuritySchemes(doc, namespace)
+
+			// Update schema references using explicit mappings
+			if err := updateSchemaReferencesInDocument(ctx, doc, schemaMappings); err != nil {
+				return nil, fmt.Errorf("failed to update schema references for namespace %s: %w", namespace, err)
+			}
+
+			// Update component references for parameters, responses, requestBodies, headers, securitySchemes
+			if err := updateComponentReferencesInDocument(ctx, doc, namespaceMappings{
+				Parameters:      paramMappings,
+				Responses:       responseMappings,
+				RequestBodies:   requestBodyMappings,
+				Headers:         headerMappings,
+				SecuritySchemes: secSchemeMappings,
+			}); err != nil {
+				return nil, fmt.Errorf("failed to update component references for namespace %s: %w", namespace, err)
+			}
+
+			// Update security requirement keys to match renamed security schemes
+			updateSecurityRequirements(doc, secSchemeMappings)
+		}
+
 		if mergedDoc == nil {
 			mergedDoc = doc
+			initMergeState(state, doc, namespace)
 			continue
 		}
 
 		var errs []error
-		mergedDoc, errs = MergeDocuments(mergedDoc, doc)
+		mergedDoc, errs = mergeDocumentsWithState(state, mergedDoc, doc, namespace, i+1)
 		warnings = append(warnings, errs...)
 	}
 
@@ -110,62 +179,93 @@ func merge(inSchemas [][]byte, yamlOut bool) ([]byte, error) {
 		return nil, errors.New("no documents to merge")
 	}
 
-	var rendered []byte
+	// Post-merge: deduplicate operationIds
+	deduplicateOperationIds(state, mergedDoc)
+
+	// Post-merge: collapse namespaced components that are equivalent
+	// (ignoring description/summary differences)
+	deduplicateEquivalentComponents(mergedDoc)
+
+	// Post-merge: normalize operation-level tag references to match
+	// the chosen document-level tag names (case-insensitive)
+	normalizeOperationTags(mergedDoc)
+
+	buf := bytes.NewBuffer(nil)
 	var err error
-	if yamlOut {
-		rendered, err = mergedDoc.Render()
-		if err != nil {
-			return nil, err
+
+	// Set output format on the document's core config
+	if core := mergedDoc.GetCore(); core != nil {
+		config := core.Config
+		if config == nil {
+			config = yml.GetDefaultConfig()
 		}
-	} else {
-		rendered, err = mergedDoc.RenderJSON("  ")
-		if err != nil {
-			return nil, err
+		if yamlOut {
+			config.OutputFormat = yml.OutputFormatYAML
+		} else {
+			config.OutputFormat = yml.OutputFormatJSON
 		}
+		core.SetConfig(config)
 	}
 
-	if len(warnings) > 0 {
-		return rendered, multierror.Append(nil, warnings...)
-	}
-
-	return rendered, nil
-}
-
-// TODO better errors
-func loadOpenAPIDocument(data []byte) (*v3.Document, error) {
-	doc, err := libopenapi.NewDocumentWithConfiguration(data, &datamodel.DocumentConfiguration{
-		AllowFileReferences:                 true,
-		IgnorePolymorphicCircularReferences: true,
-		IgnoreArrayCircularReferences:       true,
-	})
+	err = openapi.Marshal(ctx, mergedDoc, buf)
 	if err != nil {
 		return nil, err
 	}
 
-	if doc.GetSpecInfo().SpecType != utils.OpenApi3 {
+	if len(warnings) > 0 {
+		return buf.Bytes(), multierror.Append(nil, warnings...)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// loadOpenAPIDocument loads an OpenAPI document using the speakeasy-api/openapi parser.
+func loadOpenAPIDocument(ctx context.Context, data []byte) (*openapi.OpenAPI, error) {
+	doc, validationErrs, err := openapi.Unmarshal(ctx, bytes.NewReader(data), openapi.WithSkipValidation())
+	if err != nil {
+		return nil, err
+	}
+
+	// Log validation errors but don't fail - let the merge proceed
+	for _, validationErr := range validationErrs {
+		log.From(ctx).Warn(fmt.Sprintf("validation warning: %s", validationErr.Error()))
+	}
+
+	// Check if it's OpenAPI 3.x
+	if !strings.HasPrefix(doc.OpenAPI, "3.") {
 		return nil, errors.New("only OpenAPI 3.x is supported")
 	}
 
-	model, buildErrs := doc.BuildV3Model()
-	if len(buildErrs) > 0 {
-		return nil, errors.Join(buildErrs...)
-	}
-
-	return &model.Model, nil
+	return doc, nil
 }
 
-func MergeDocuments(mergedDoc, doc *v3.Document) (*v3.Document, []error) {
-	mergedVersion, _ := version.NewSemver(mergedDoc.Version)
-	docVersion, _ := version.NewSemver(doc.Version)
+// MergeDocuments merges two OpenAPI documents into one.
+// This is the public backward-compatible API. For namespace-aware merging,
+// the internal mergeDocumentsWithState is used instead.
+func MergeDocuments(mergedDoc, doc *openapi.OpenAPI) (*openapi.OpenAPI, []error) {
+	state := newMergeState()
+	initMergeState(state, mergedDoc, "")
+	merged, errs := mergeDocumentsWithState(state, mergedDoc, doc, "", 2)
+	deduplicateOperationIds(state, merged)
+	normalizeOperationTags(merged)
+	return merged, errs
+}
+
+// mergeDocumentsWithState merges two OpenAPI documents with namespace-aware
+// tag deduplication, path/method conflict disambiguation, and operationId tracking.
+func mergeDocumentsWithState(state *mergeState, mergedDoc, doc *openapi.OpenAPI, docNamespace string, docCounter int) (*openapi.OpenAPI, []error) {
+	mergedVersion, _ := version.NewSemver(mergedDoc.OpenAPI)
+	docVersion, _ := version.NewSemver(doc.OpenAPI)
 	errs := make([]error, 0)
+
 	if mergedVersion == nil || docVersion != nil && docVersion.GreaterThan(mergedVersion) {
-		mergedDoc.Version = doc.Version
+		mergedDoc.OpenAPI = doc.OpenAPI
 	}
 
-	if doc.Info != nil {
-		mergedDoc.Info = doc.Info
-	}
+	// Merge Info - last wins for most fields, but append description and summary
+	mergedDoc.Info = mergeInfo(mergedDoc.Info, doc.Info)
 
+	// Merge Extensions
 	if doc.Extensions != nil {
 		var extErrors []error
 		mergedDoc.Extensions, extErrors = mergeExtensions(mergedDoc.Extensions, doc.Extensions)
@@ -174,6 +274,7 @@ func MergeDocuments(mergedDoc, doc *v3.Document) (*v3.Document, []error) {
 		}
 	}
 
+	// Merge Servers
 	mergedServers, opServers := mergeServers(mergedDoc.Servers, doc.Servers, true)
 	if len(opServers) > 0 {
 		setOperationServers(mergedDoc, mergedDoc.Servers)
@@ -183,55 +284,23 @@ func MergeDocuments(mergedDoc, doc *v3.Document) (*v3.Document, []error) {
 		mergedDoc.Servers = mergedServers
 	}
 
-	// TODO we might need to merge this such that the security from different docs are combined in an OR fashion
+	// Merge Security
 	if doc.Security != nil {
 		mergedDoc.Security = doc.Security
 	}
 
-	if doc.Tags != nil {
-		if mergedDoc.Tags == nil {
-			mergedDoc.Tags = doc.Tags
-		} else {
-			for _, tag := range doc.Tags {
-				replaced := false
+	// Merge Tags (case-insensitive with content-aware disambiguation)
+	tagResult := mergeTagsWithState(state, mergedDoc, doc, docNamespace, docCounter)
+	// Update operation-level tag references in each doc using its own rename map
+	// (case-insensitive matching, per-document maps avoid ambiguity)
+	updateOperationTagRefs(mergedDoc, tagResult.existingRenames)
+	updateOperationTagRefs(doc, tagResult.incomingRenames)
 
-				for i, mergedTag := range mergedDoc.Tags {
-					if mergedTag.Name == tag.Name {
-						mergedDoc.Tags[i] = tag
-						replaced = true
-						break
-					}
-				}
+	// Merge Paths (with method-level conflict detection and fragment disambiguation)
+	pathErrs := mergePathsWithState(state, mergedDoc, doc, docNamespace, docCounter)
+	errs = append(errs, pathErrs...)
 
-				if !replaced {
-					mergedDoc.Tags = append(mergedDoc.Tags, tag)
-				}
-			}
-		}
-	}
-
-	if doc.Paths != nil {
-		if mergedDoc.Paths == nil {
-			mergedDoc.Paths = doc.Paths
-		} else {
-			var extensionErr []error
-			mergedDoc.Paths.Extensions, extensionErr = mergeExtensions(mergedDoc.Paths.Extensions, doc.Paths.Extensions)
-			errs = append(errs, extensionErr...)
-
-			for pair := orderedmap.First(doc.Paths.PathItems); pair != nil; pair = pair.Next() {
-				path := pair.Key()
-				pathItem := pair.Value()
-				if mergedPathItem, ok := mergedDoc.Paths.PathItems.Get(path); !ok {
-					mergedDoc.Paths.PathItems.Set(path, pathItem)
-				} else {
-					pi, pathItemErrs := mergePathItems(mergedPathItem, pathItem)
-					mergedDoc.Paths.PathItems.Set(path, pi)
-					errs = append(errs, pathItemErrs...)
-				}
-			}
-		}
-	}
-
+	// Merge Components
 	if doc.Components != nil {
 		if mergedDoc.Components == nil {
 			mergedDoc.Components = doc.Components
@@ -242,17 +311,17 @@ func MergeDocuments(mergedDoc, doc *v3.Document) (*v3.Document, []error) {
 		}
 	}
 
+	// Merge Webhooks
 	if doc.Webhooks != nil {
 		if mergedDoc.Webhooks == nil {
 			mergedDoc.Webhooks = doc.Webhooks
 		} else {
-			for pair := orderedmap.First(doc.Webhooks); pair != nil; pair = pair.Next() {
-				path := pair.Key()
-				webhook := pair.Value()
+			for path, webhook := range doc.Webhooks.All() {
 				if _, ok := mergedDoc.Webhooks.Get(path); !ok {
 					mergedDoc.Webhooks.Set(path, webhook)
 				} else {
-					pi, pathItemErrs := mergePathItems(mergedDoc.Webhooks.GetOrZero(path), webhook)
+					mergedWebhook, _ := mergedDoc.Webhooks.Get(path)
+					pi, pathItemErrs := mergeReferencedPathItems(mergedWebhook, webhook)
 					mergedDoc.Webhooks.Set(path, pi)
 					errs = append(errs, pathItemErrs...)
 				}
@@ -260,6 +329,7 @@ func MergeDocuments(mergedDoc, doc *v3.Document) (*v3.Document, []error) {
 		}
 	}
 
+	// Merge ExternalDocs
 	if doc.ExternalDocs != nil {
 		mergedDoc.ExternalDocs = doc.ExternalDocs
 	}
@@ -267,60 +337,107 @@ func MergeDocuments(mergedDoc, doc *v3.Document) (*v3.Document, []error) {
 	return mergedDoc, errs
 }
 
-func mergePathItems(mergedPathItem, pathItem *v3.PathItem) (*v3.PathItem, []error) {
-	var errors []error
-	if pathItem.Delete != nil {
-		mergedPathItem.Delete = pathItem.Delete
+// mergeInfo merges two Info objects. Most fields use last-wins semantics,
+// but Description and Summary are appended (with a newline separator) so that
+// content from all merged documents is preserved.
+func mergeInfo(merged, incoming openapi.Info) openapi.Info {
+	existingDesc := derefStr(merged.Description)
+	existingSummary := derefStr(merged.Summary)
+
+	// Take the incoming info (last wins for most fields)
+	result := incoming
+
+	// Append descriptions across documents
+	result.Description = appendStrPtrs(existingDesc, derefStr(incoming.Description))
+
+	// Append summaries across documents
+	result.Summary = appendStrPtrs(existingSummary, derefStr(incoming.Summary))
+
+	return result
+}
+
+func derefStr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func appendStrPtrs(a, b string) *string {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+
+	switch {
+	case a != "" && b != "" && a != b:
+		combined := a + "\n" + b
+		return &combined
+	case a != "":
+		return &a
+	case b != "":
+		return &b
+	default:
+		return nil
+	}
+}
+
+func mergeReferencedPathItems(mergedPathItem, pathItem *openapi.ReferencedPathItem) (*openapi.ReferencedPathItem, []error) {
+	if pathItem == nil {
+		return mergedPathItem, nil
+	}
+	if mergedPathItem == nil {
+		return pathItem, nil
 	}
 
-	if pathItem.Get != nil {
-		mergedPathItem.Get = pathItem.Get
+	// If either is a reference, prefer the new one
+	if pathItem.Object == nil {
+		return pathItem, nil
+	}
+	if mergedPathItem.Object == nil {
+		mergedPathItem.Object = pathItem.Object
+		return mergedPathItem, nil
 	}
 
-	if pathItem.Head != nil {
-		mergedPathItem.Head = pathItem.Head
+	// Both have objects, merge them
+	merged, errs := mergePathItemObjects(mergedPathItem.Object, pathItem.Object)
+	mergedPathItem.Object = merged
+	return mergedPathItem, errs
+}
+
+func mergePathItemObjects(mergedPathItem, pathItem *openapi.PathItem) (*openapi.PathItem, []error) {
+	var errs []error
+
+	// Merge operations
+	for method, op := range pathItem.All() {
+		mergedPathItem.Set(method, op)
 	}
 
-	if pathItem.Options != nil {
-		mergedPathItem.Options = pathItem.Options
-	}
-
-	if pathItem.Patch != nil {
-		mergedPathItem.Patch = pathItem.Patch
-	}
-
-	if pathItem.Post != nil {
-		mergedPathItem.Post = pathItem.Post
-	}
-
-	if pathItem.Put != nil {
-		mergedPathItem.Put = pathItem.Put
-	}
-
-	if pathItem.Trace != nil {
-		mergedPathItem.Trace = pathItem.Trace
-	}
-
-	if pathItem.Summary != "" {
+	// Merge Summary
+	if pathItem.Summary != nil && *pathItem.Summary != "" {
 		mergedPathItem.Summary = pathItem.Summary
 	}
 
-	if pathItem.Description != "" {
+	// Merge Description
+	if pathItem.Description != nil && *pathItem.Description != "" {
 		mergedPathItem.Description = pathItem.Description
 	}
 
+	// Merge Parameters
 	mergedPathItem.Parameters = mergeParameters(mergedPathItem.Parameters, pathItem.Parameters)
 
+	// Merge Servers
 	mergedPathItem.Servers, _ = mergeServers(mergedPathItem.Servers, pathItem.Servers, false)
 
+	// Merge Extensions
 	if pathItem.Extensions != nil {
-		mergedPathItem.Extensions, errors = mergeExtensions(mergedPathItem.Extensions, pathItem.Extensions)
+		var extErrs []error
+		mergedPathItem.Extensions, extErrs = mergeExtensions(mergedPathItem.Extensions, pathItem.Extensions)
+		errs = append(errs, extErrs...)
 	}
 
-	return mergedPathItem, errors
+	return mergedPathItem, errs
 }
 
-func mergeServers(mergedServers, servers []*v3.Server, global bool) ([]*v3.Server, []*v3.Server) {
+func mergeServers(mergedServers, servers []*openapi.Server, global bool) ([]*openapi.Server, []*openapi.Server) {
 	if len(mergedServers) == 0 {
 		return servers, nil
 	}
@@ -331,7 +448,6 @@ func mergeServers(mergedServers, servers []*v3.Server, global bool) ([]*v3.Serve
 		if len(mergedServers) > 0 {
 			for _, server := range servers {
 				for _, mergedServer := range mergedServers {
-					// We share common servers, so we can merge them
 					if mergedServer.URL == server.URL {
 						mergeable = true
 					}
@@ -347,7 +463,6 @@ func mergeServers(mergedServers, servers []*v3.Server, global bool) ([]*v3.Serve
 
 		for _, server := range servers {
 			replaced := false
-
 			for i, mergedServer := range mergedServers {
 				if mergedServer.URL == server.URL {
 					mergedServers[i] = server
@@ -355,7 +470,6 @@ func mergeServers(mergedServers, servers []*v3.Server, global bool) ([]*v3.Serve
 					break
 				}
 			}
-
 			if !replaced {
 				mergedServers = append(mergedServers, server)
 			}
@@ -365,7 +479,7 @@ func mergeServers(mergedServers, servers []*v3.Server, global bool) ([]*v3.Serve
 	return mergedServers, nil
 }
 
-func mergeParameters(mergedParameters, parameters []*v3.Parameter) []*v3.Parameter {
+func mergeParameters(mergedParameters, parameters []*openapi.ReferencedParameter) []*openapi.ReferencedParameter {
 	if len(mergedParameters) == 0 {
 		return parameters
 	}
@@ -373,9 +487,10 @@ func mergeParameters(mergedParameters, parameters []*v3.Parameter) []*v3.Paramet
 	if len(parameters) > 0 {
 		for _, parameter := range parameters {
 			replaced := false
+			paramName := getParameterName(parameter)
 
 			for i, mergedParameter := range mergedParameters {
-				if mergedParameter.Name == parameter.Name {
+				if getParameterName(mergedParameter) == paramName {
 					mergedParameters[i] = parameter
 					replaced = true
 					break
@@ -391,150 +506,193 @@ func mergeParameters(mergedParameters, parameters []*v3.Parameter) []*v3.Paramet
 	return mergedParameters
 }
 
-func mergeComponents(mergedComponents, components *v3.Components) (*v3.Components, []error) {
+func getParameterName(param *openapi.ReferencedParameter) string {
+	if param == nil {
+		return ""
+	}
+	if param.Object != nil {
+		return param.Object.Name
+	}
+	if param.Reference != nil {
+		return string(*param.Reference)
+	}
+	return ""
+}
+
+func mergeComponents(mergedComponents, components *openapi.Components) (*openapi.Components, []error) {
 	errs := make([]error, 0)
+
+	// Merge Schemas
 	if components.Schemas != nil {
 		if mergedComponents.Schemas == nil {
 			mergedComponents.Schemas = components.Schemas
 		} else {
-			for pair := orderedmap.First(components.Schemas); pair != nil; pair = pair.Next() {
-				name := pair.Key()
-				schema := pair.Value()
-				if err := isEquivalent(mergedComponents.Schemas.GetOrZero(name), schema); err != nil {
-					errs = append(errs, err)
+			for name, schema := range components.Schemas.All() {
+				existing, exists := mergedComponents.Schemas.Get(name)
+				if exists {
+					if err := isSchemaEquivalent(existing, schema); err != nil {
+						errs = append(errs, err)
+					}
 				}
-
 				mergedComponents.Schemas.Set(name, schema)
-				mergedComponents.Schemas.GetOrZero(name).GoLow().GetKeyNode().Line = schema.GoLow().GetKeyNode().Line
 			}
 		}
 	}
 
+	// Merge Responses
 	if components.Responses != nil {
 		if mergedComponents.Responses == nil {
 			mergedComponents.Responses = components.Responses
 		} else {
-			for pair := orderedmap.First(components.Responses); pair != nil; pair = pair.Next() {
-				name := pair.Key()
-				response := pair.Value()
-				if err := isEquivalent(mergedComponents.Responses.GetOrZero(name), response); err != nil {
-					errs = append(errs, err)
+			for name, response := range components.Responses.All() {
+				existing, exists := mergedComponents.Responses.Get(name)
+				if exists {
+					if err := isReferencedEquivalent(existing, response); err != nil {
+						errs = append(errs, err)
+					}
 				}
 				mergedComponents.Responses.Set(name, response)
 			}
 		}
 	}
 
+	// Merge Parameters
 	if components.Parameters != nil {
 		if mergedComponents.Parameters == nil {
 			mergedComponents.Parameters = components.Parameters
 		} else {
-			for pair := orderedmap.First(components.Parameters); pair != nil; pair = pair.Next() {
-				name := pair.Key()
-				parameter := pair.Value()
-				if err := isEquivalent(mergedComponents.Parameters.GetOrZero(name), parameter); err != nil {
-					errs = append(errs, err)
+			for name, parameter := range components.Parameters.All() {
+				existing, exists := mergedComponents.Parameters.Get(name)
+				if exists {
+					if err := isReferencedEquivalent(existing, parameter); err != nil {
+						errs = append(errs, err)
+					}
 				}
-
 				mergedComponents.Parameters.Set(name, parameter)
 			}
 		}
 	}
 
+	// Merge Examples
 	if components.Examples != nil {
 		if mergedComponents.Examples == nil {
 			mergedComponents.Examples = components.Examples
 		} else {
-			for pair := orderedmap.First(components.Examples); pair != nil; pair = pair.Next() {
-				name := pair.Key()
-				example := pair.Value()
-				if err := isEquivalent(mergedComponents.Examples.GetOrZero(name), example); err != nil {
-					errs = append(errs, err)
+			for name, example := range components.Examples.All() {
+				existing, exists := mergedComponents.Examples.Get(name)
+				if exists {
+					if err := isReferencedEquivalent(existing, example); err != nil {
+						errs = append(errs, err)
+					}
 				}
-
 				mergedComponents.Examples.Set(name, example)
 			}
 		}
 	}
 
+	// Merge RequestBodies
 	if components.RequestBodies != nil {
 		if mergedComponents.RequestBodies == nil {
 			mergedComponents.RequestBodies = components.RequestBodies
 		} else {
-			for pair := orderedmap.First(components.RequestBodies); pair != nil; pair = pair.Next() {
-				name := pair.Key()
-				requestBody := pair.Value()
-				if err := isEquivalent(mergedComponents.RequestBodies.GetOrZero(name), requestBody); err != nil {
-					errs = append(errs, err)
+			for name, requestBody := range components.RequestBodies.All() {
+				existing, exists := mergedComponents.RequestBodies.Get(name)
+				if exists {
+					if err := isReferencedEquivalent(existing, requestBody); err != nil {
+						errs = append(errs, err)
+					}
 				}
 				mergedComponents.RequestBodies.Set(name, requestBody)
 			}
 		}
 	}
 
+	// Merge Headers
 	if components.Headers != nil {
 		if mergedComponents.Headers == nil {
 			mergedComponents.Headers = components.Headers
 		} else {
-			for pair := orderedmap.First(components.Headers); pair != nil; pair = pair.Next() {
-				name := pair.Key()
-				header := pair.Value()
-				if err := isEquivalent(mergedComponents.Headers.GetOrZero(name), header); err != nil {
-					errs = append(errs, err)
+			for name, header := range components.Headers.All() {
+				existing, exists := mergedComponents.Headers.Get(name)
+				if exists {
+					if err := isReferencedEquivalent(existing, header); err != nil {
+						errs = append(errs, err)
+					}
 				}
 				mergedComponents.Headers.Set(name, header)
 			}
 		}
 	}
 
+	// Merge SecuritySchemes
 	if components.SecuritySchemes != nil {
 		if mergedComponents.SecuritySchemes == nil {
 			mergedComponents.SecuritySchemes = components.SecuritySchemes
 		} else {
-			for pair := orderedmap.First(components.SecuritySchemes); pair != nil; pair = pair.Next() {
-				name := pair.Key()
-				securityScheme := pair.Value()
-				if err := isEquivalent(mergedComponents.SecuritySchemes.GetOrZero(name), securityScheme); err != nil {
-					errs = append(errs, err)
+			for name, securityScheme := range components.SecuritySchemes.All() {
+				existing, exists := mergedComponents.SecuritySchemes.Get(name)
+				if exists {
+					if err := isReferencedEquivalent(existing, securityScheme); err != nil {
+						errs = append(errs, err)
+					}
 				}
-
 				mergedComponents.SecuritySchemes.Set(name, securityScheme)
 			}
 		}
 	}
 
+	// Merge Links
 	if components.Links != nil {
 		if mergedComponents.Links == nil {
 			mergedComponents.Links = components.Links
 		} else {
-			for pair := orderedmap.First(components.Links); pair != nil; pair = pair.Next() {
-				name := pair.Key()
-				link := pair.Value()
-				if err := isEquivalent(mergedComponents.Links.GetOrZero(name), link); err != nil {
-					errs = append(errs, err)
+			for name, link := range components.Links.All() {
+				existing, exists := mergedComponents.Links.Get(name)
+				if exists {
+					if err := isReferencedEquivalent(existing, link); err != nil {
+						errs = append(errs, err)
+					}
 				}
-
 				mergedComponents.Links.Set(name, link)
 			}
 		}
 	}
 
+	// Merge Callbacks
 	if components.Callbacks != nil {
 		if mergedComponents.Callbacks == nil {
 			mergedComponents.Callbacks = components.Callbacks
 		} else {
-			for pair := orderedmap.First(components.Callbacks); pair != nil; pair = pair.Next() {
-				name := pair.Key()
-				callback := pair.Value()
-				if err := isEquivalent(mergedComponents.Callbacks.GetOrZero(name), callback); err != nil {
-					errs = append(errs, err)
+			for name, callback := range components.Callbacks.All() {
+				existing, exists := mergedComponents.Callbacks.Get(name)
+				if exists {
+					if err := isReferencedEquivalent(existing, callback); err != nil {
+						errs = append(errs, err)
+					}
 				}
-
 				mergedComponents.Callbacks.Set(name, callback)
 			}
 		}
 	}
 
+	// Merge PathItems
+	if components.PathItems != nil {
+		if mergedComponents.PathItems == nil {
+			mergedComponents.PathItems = components.PathItems
+		} else {
+			for name, pathItem := range components.PathItems.All() {
+				existing, exists := mergedComponents.PathItems.Get(name)
+				if exists {
+					if err := isReferencedEquivalent(existing, pathItem); err != nil {
+						errs = append(errs, err)
+					}
+				}
+				mergedComponents.PathItems.Set(name, pathItem)
+			}
+		}
+	}
+
+	// Merge Extensions
 	if components.Extensions != nil {
 		var extensionErrs []error
 		mergedComponents.Extensions, extensionErrs = mergeExtensions(mergedComponents.Extensions, components.Extensions)
@@ -544,49 +702,84 @@ func mergeComponents(mergedComponents, components *v3.Components) (*v3.Component
 	return mergedComponents, errs
 }
 
-type yamlComparable interface {
-	MarshalYAMLInline() (interface{}, error)
-	GoLow() interface {
-		Hash() [32]byte
+// descriptiveFields are fields that should be ignored when comparing components
+// for equivalence during merging. Two components that differ only in these fields
+// are considered equivalent (e.g. security schemes with different descriptions
+// but the same type/scheme/bearerFormat).
+var descriptiveFields = map[string]bool{
+	"description": true,
+	"summary":     true,
+}
+
+// stripDescriptiveFields removes description and summary keys from a yaml.Node
+// tree so that they don't cause false conflicts during merge comparison.
+func stripDescriptiveFields(node *yaml.Node) {
+	if node == nil {
+		return
+	}
+
+	if node.Kind == yaml.DocumentNode {
+		for _, child := range node.Content {
+			stripDescriptiveFields(child)
+		}
+		return
+	}
+
+	if node.Kind == yaml.MappingNode {
+		filtered := make([]*yaml.Node, 0, len(node.Content))
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			value := node.Content[i+1]
+			if key.Kind == yaml.ScalarNode && descriptiveFields[key.Value] {
+				continue
+			}
+			stripDescriptiveFields(value)
+			filtered = append(filtered, key, value)
+		}
+		node.Content = filtered
+		return
+	}
+
+	if node.Kind == yaml.SequenceNode {
+		for _, child := range node.Content {
+			stripDescriptiveFields(child)
+		}
 	}
 }
 
-type YAMLComparable interface {
-	MarshalYAML() (interface{}, error)
-}
-
-func isEquivalent(a YAMLComparable, b YAMLComparable) error {
-	if a == nil || (reflect.ValueOf(a).Kind() == reflect.Ptr && reflect.ValueOf(a).IsNil()) || b == nil || (reflect.ValueOf(b).Kind() == reflect.Ptr && reflect.ValueOf(b).IsNil()) {
+// isSchemaEquivalent checks if two schemas are equivalent
+func isSchemaEquivalent(a, b *oas3.JSONSchema[oas3.Referenceable]) error {
+	if a == nil || b == nil {
 		return nil
 	}
-	aInner, err := a.MarshalYAML()
-	if err != nil {
-		return fmt.Errorf("error marshalling %#v: %w", a, err)
+
+	// Marshal both to YAML and compare
+	ctx := context.Background()
+	bufA := bytes.NewBuffer(nil)
+	bufB := bytes.NewBuffer(nil)
+
+	if err := marshaller.Marshal(ctx, a, bufA); err != nil {
+		return fmt.Errorf("error marshalling schema a: %w", err)
+	}
+	if err := marshaller.Marshal(ctx, b, bufB); err != nil {
+		return fmt.Errorf("error marshalling schema b: %w", err)
 	}
 
-	bInner, err := b.MarshalYAML()
-	if err != nil {
-		return fmt.Errorf("error marshalling %#v: %w", a, err)
+	var nodeA, nodeB yaml.Node
+	if err := yaml.Unmarshal(bufA.Bytes(), &nodeA); err != nil {
+		return fmt.Errorf("error unmarshalling schema a: %w", err)
+	}
+	if err := yaml.Unmarshal(bufB.Bytes(), &nodeB); err != nil {
+		return fmt.Errorf("error unmarshalling schema b: %w", err)
 	}
 
-	aNode := aInner.(*yaml.Node)
-	bNode := bInner.(*yaml.Node)
-	nodeOverlay, err := overlay.Compare("comparison between yaml nodes", aNode, *bNode)
-	if err != nil {
-		return fmt.Errorf("error comparing %#v and %#v: %w", a, b, err)
-	}
+	// Strip description/summary so they don't cause false conflicts
+	stripDescriptiveFields(&nodeA)
+	stripDescriptiveFields(&nodeB)
 
-	bufA := &bytes.Buffer{}
-	bufB := &bytes.Buffer{}
-	decodeA := yaml.NewEncoder(bufA)
-	decodeB := yaml.NewEncoder(bufB)
-	err = decodeA.Encode(aInner)
+	nodeOverlay, err := overlay.Compare("comparison between schemas", &nodeA, nodeB)
 	if err != nil {
-		return fmt.Errorf("failed to cast %#v to yaml.Node", aInner)
-	}
-	err = decodeB.Encode(bInner)
-	if err != nil {
-		return fmt.Errorf("failed to cast %#v to yaml.Node", bInner)
+		return fmt.Errorf("error comparing schemas: %w", err)
 	}
 
 	if len(nodeOverlay.Actions) > 0 {
@@ -596,16 +789,63 @@ func isEquivalent(a YAMLComparable, b YAMLComparable) error {
 	return nil
 }
 
-func mergeExtensions(mergedExtensions, extensions *orderedmap.Map[string, *yaml.Node]) (*orderedmap.Map[string, *yaml.Node], []error) {
-	if mergedExtensions == nil {
-		return extensions, nil
+// isReferencedEquivalent checks if two referenced objects are equivalent using YAML comparison
+func isReferencedEquivalent[T any](a, b *T) error {
+	if a == nil || b == nil {
+		return nil
 	}
+
+	// Use reflect.DeepEqual for simple comparison
+	if reflect.DeepEqual(a, b) {
+		return nil
+	}
+
+	// Marshal both to YAML and compare using yaml.Marshal directly
+	// (marshaller.Marshal requires a specific interface that generics don't satisfy)
+	bytesA, err := yaml.Marshal(a)
+	if err != nil {
+		return fmt.Errorf("error marshalling a: %w", err)
+	}
+	bytesB, err := yaml.Marshal(b)
+	if err != nil {
+		return fmt.Errorf("error marshalling b: %w", err)
+	}
+
+	var nodeA, nodeB yaml.Node
+	if err := yaml.Unmarshal(bytesA, &nodeA); err != nil {
+		return fmt.Errorf("error unmarshalling a: %w", err)
+	}
+	if err := yaml.Unmarshal(bytesB, &nodeB); err != nil {
+		return fmt.Errorf("error unmarshalling b: %w", err)
+	}
+
+	// Strip description/summary so they don't cause false conflicts
+	stripDescriptiveFields(&nodeA)
+	stripDescriptiveFields(&nodeB)
+
+	nodeOverlay, err := overlay.Compare("comparison between objects", &nodeA, nodeB)
+	if err != nil {
+		return fmt.Errorf("error comparing objects: %w", err)
+	}
+
+	if len(nodeOverlay.Actions) > 0 {
+		return fmt.Errorf("objects are not equivalent: \nObject 1 = %s\n\n Object 2 = %s", string(bytesA), string(bytesB))
+	}
+
+	return nil
+}
+
+func mergeExtensions(mergedExtensions, exts *extensions.Extensions) (*extensions.Extensions, []error) {
+	if mergedExtensions == nil {
+		return exts, nil
+	}
+	if exts == nil {
+		return mergedExtensions, nil
+	}
+
 	errs := make([]error, 0)
 
-	for pair := orderedmap.First(extensions); pair != nil; pair = pair.Next() {
-		name := pair.Key()
-		extYamlNode := pair.Value()
-
+	for name, extYamlNode := range exts.All() {
 		var ext any
 		if extYamlNode != nil {
 			_ = extYamlNode.Decode(&ext)
@@ -628,19 +868,370 @@ func mergeExtensions(mergedExtensions, extensions *orderedmap.Map[string, *yaml.
 	return mergedExtensions, errs
 }
 
-func setOperationServers(doc *v3.Document, opServers []*v3.Server) {
+// deduplicateEquivalentComponents collapses namespaced components that are
+// equivalent (ignoring description/summary). For example, if svcA_bearerAuth
+// and svcB_bearerAuth are identical security schemes except for description,
+// they are collapsed into a single bearerAuth entry.
+func deduplicateEquivalentComponents(doc *openapi.OpenAPI) {
+	if doc == nil || doc.Components == nil {
+		return
+	}
+
+	deduplicateSecuritySchemes(doc)
+}
+
+// getNameOverride reads the x-speakeasy-name-override extension value from an extensions map.
+func getNameOverride(exts *extensions.Extensions) string {
+	if exts == nil {
+		return ""
+	}
+	node, ok := exts.Get("x-speakeasy-name-override")
+	if !ok || node == nil {
+		return ""
+	}
+	return node.Value
+}
+
+// isEquivalentIgnoringDescriptiveAndNamespaceFields checks if two objects are
+// equivalent after stripping description, summary, and x-speakeasy-* extension fields.
+func isEquivalentIgnoringDescriptiveAndNamespaceFields[T any](a, b *T) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+
+	bytesA, err := yaml.Marshal(a)
+	if err != nil {
+		return false
+	}
+	bytesB, err := yaml.Marshal(b)
+	if err != nil {
+		return false
+	}
+
+	var nodeA, nodeB yaml.Node
+	if err := yaml.Unmarshal(bytesA, &nodeA); err != nil {
+		return false
+	}
+	if err := yaml.Unmarshal(bytesB, &nodeB); err != nil {
+		return false
+	}
+
+	stripDescriptiveFields(&nodeA)
+	stripDescriptiveFields(&nodeB)
+	stripSpeakeasyExtensions(&nodeA)
+	stripSpeakeasyExtensions(&nodeB)
+
+	nodeOverlay, err := overlay.Compare("equivalence check", &nodeA, nodeB)
+	if err != nil {
+		return false
+	}
+	return len(nodeOverlay.Actions) == 0
+}
+
+// stripSpeakeasyExtensions removes x-speakeasy-name-override and
+// x-speakeasy-model-namespace from yaml mapping nodes.
+func stripSpeakeasyExtensions(node *yaml.Node) {
+	if node == nil {
+		return
+	}
+
+	if node.Kind == yaml.DocumentNode {
+		for _, child := range node.Content {
+			stripSpeakeasyExtensions(child)
+		}
+		return
+	}
+
+	if node.Kind == yaml.MappingNode {
+		filtered := make([]*yaml.Node, 0, len(node.Content))
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			value := node.Content[i+1]
+			if key.Kind == yaml.ScalarNode &&
+				(key.Value == "x-speakeasy-name-override" || key.Value == "x-speakeasy-model-namespace") {
+				continue
+			}
+			stripSpeakeasyExtensions(value)
+			filtered = append(filtered, key, value)
+		}
+		node.Content = filtered
+		return
+	}
+
+	if node.Kind == yaml.SequenceNode {
+		for _, child := range node.Content {
+			stripSpeakeasyExtensions(child)
+		}
+	}
+}
+
+// schemeEntry pairs a namespaced component name with its security scheme.
+// Used during deduplication to track grouped entries.
+type schemeEntry struct {
+	namespacedName string
+	scheme         *openapi.ReferencedSecurityScheme
+}
+
+// areMergeableSecuritySchemes checks whether two security schemes can be
+// collapsed into one during deduplication. The check is type-aware:
+//   - oauth2: mergeable if same flow types present with matching URLs (scopes may differ)
+//   - http: mergeable if same scheme and bearerFormat
+//   - apiKey: mergeable if same name and in
+//   - openIdConnect: mergeable if same openIdConnectUrl
+//   - mutualTLS: always mergeable
+func areMergeableSecuritySchemes(a, b *openapi.SecurityScheme) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if a.Type != b.Type {
+		return false
+	}
+
+	switch a.Type {
+	case openapi.SecuritySchemeTypeOAuth2:
+		return areMergeableOAuth2Schemes(a, b)
+	case openapi.SecuritySchemeTypeHTTP:
+		return a.GetScheme() == b.GetScheme() && a.GetBearerFormat() == b.GetBearerFormat()
+	case openapi.SecuritySchemeTypeAPIKey:
+		return a.GetName() == b.GetName() && a.GetIn() == b.GetIn()
+	case openapi.SecuritySchemeTypeOpenIDConnect:
+		return a.GetOpenIdConnectUrl() == b.GetOpenIdConnectUrl()
+	case openapi.SecuritySchemeTypeMutualTLS:
+		return true
+	default:
+		return isEquivalentIgnoringDescriptiveAndNamespaceFields(a, b)
+	}
+}
+
+// areMergeableOAuth2Schemes checks whether two oauth2 security schemes have
+// the same flow types present with matching URLs per flow. Scopes and
+// descriptions are allowed to differ.
+func areMergeableOAuth2Schemes(a, b *openapi.SecurityScheme) bool {
+	af, bf := a.Flows, b.Flows
+	if (af == nil) != (bf == nil) {
+		return false
+	}
+	if af == nil {
+		return true
+	}
+
+	// Check that both schemes have the same set of flows present
+	if (af.Implicit == nil) != (bf.Implicit == nil) ||
+		(af.Password == nil) != (bf.Password == nil) ||
+		(af.ClientCredentials == nil) != (bf.ClientCredentials == nil) ||
+		(af.AuthorizationCode == nil) != (bf.AuthorizationCode == nil) ||
+		(af.DeviceAuthorization == nil) != (bf.DeviceAuthorization == nil) {
+		return false
+	}
+
+	// For each present flow, check that URLs match
+	if af.Implicit != nil && !oauthFlowURLsMatch(af.Implicit, bf.Implicit) {
+		return false
+	}
+	if af.Password != nil && !oauthFlowURLsMatch(af.Password, bf.Password) {
+		return false
+	}
+	if af.ClientCredentials != nil && !oauthFlowURLsMatch(af.ClientCredentials, bf.ClientCredentials) {
+		return false
+	}
+	if af.AuthorizationCode != nil && !oauthFlowURLsMatch(af.AuthorizationCode, bf.AuthorizationCode) {
+		return false
+	}
+	if af.DeviceAuthorization != nil && !oauthFlowURLsMatch(af.DeviceAuthorization, bf.DeviceAuthorization) {
+		return false
+	}
+
+	return true
+}
+
+// oauthFlowURLsMatch checks whether two OAuth flows have identical URLs.
+func oauthFlowURLsMatch(a, b *openapi.OAuthFlow) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.GetAuthorizationURL() == b.GetAuthorizationURL() &&
+		a.GetTokenURL() == b.GetTokenURL() &&
+		a.GetRefreshURL() == b.GetRefreshURL() &&
+		a.GetDeviceAuthorizationURL() == b.GetDeviceAuthorizationURL()
+}
+
+// mergeSecuritySchemeDescriptions appends descriptions from all entries using
+// the same deduplicating newline-separated pattern used for info descriptions.
+func mergeSecuritySchemeDescriptions(winner *openapi.SecurityScheme, entries []schemeEntry) {
+	combined := ""
+	for _, entry := range entries {
+		desc := entry.scheme.Object.GetDescription()
+		combined = derefStr(appendStrPtrs(combined, desc))
+	}
+	if combined != "" {
+		winner.Description = &combined
+	}
+}
+
+// mergeOAuth2Scopes unions the scopes from all entries into the winner's flows.
+// Only operates on oauth2 security schemes. A fresh scopes map is built from
+// all entries in order so that the merged result is deterministic. For
+// duplicate scope keys the last description wins.
+func mergeOAuth2Scopes(winner *openapi.SecurityScheme, entries []schemeEntry) {
+	if winner.Type != openapi.SecuritySchemeTypeOAuth2 || winner.Flows == nil {
+		return
+	}
+
+	type flowPair struct {
+		winnerFlow *openapi.OAuthFlow
+		getFlow    func(*openapi.OAuthFlows) *openapi.OAuthFlow
+	}
+
+	pairs := []flowPair{
+		{winner.Flows.Implicit, (*openapi.OAuthFlows).GetImplicit},
+		{winner.Flows.Password, (*openapi.OAuthFlows).GetPassword},
+		{winner.Flows.ClientCredentials, (*openapi.OAuthFlows).GetClientCredentials},
+		{winner.Flows.AuthorizationCode, (*openapi.OAuthFlows).GetAuthorizationCode},
+		{winner.Flows.DeviceAuthorization, (*openapi.OAuthFlows).GetDeviceAuthorization},
+	}
+
+	for _, pair := range pairs {
+		wf := pair.winnerFlow
+		if wf == nil {
+			continue
+		}
+
+		// Build a fresh scopes map from all entries in order.
+		// For duplicate keys Set updates in-place (last wins for description,
+		// position preserved from first occurrence).
+		merged := sequencedmap.New[string, string]()
+		for _, entry := range entries {
+			obj := entry.scheme.Object
+			if obj.Type != openapi.SecuritySchemeTypeOAuth2 || obj.Flows == nil {
+				continue
+			}
+			ef := pair.getFlow(obj.Flows)
+			if ef == nil || ef.Scopes == nil {
+				continue
+			}
+			for scopeName, scopeDesc := range ef.Scopes.All() {
+				merged.Set(scopeName, scopeDesc)
+			}
+		}
+		wf.Scopes = merged
+	}
+}
+
+// deduplicateSecuritySchemes collapses namespaced security schemes that are
+// mergeable into a single entry. For oauth2 schemes this includes unioning
+// scopes; for all types descriptions are appended. Updates security
+// requirements throughout the document to reference the collapsed name.
+func deduplicateSecuritySchemes(doc *openapi.OpenAPI) {
+	if doc.Components == nil || doc.Components.SecuritySchemes == nil {
+		return
+	}
+
+	// Group namespaced schemes by their original name (x-speakeasy-name-override)
+	groups := make(map[string][]schemeEntry)
+	var groupOrder []string
+
+	for name, scheme := range doc.Components.SecuritySchemes.All() {
+		if scheme == nil || scheme.IsReference() || scheme.Object == nil {
+			continue
+		}
+		override := getNameOverride(scheme.Object.Extensions)
+		if override == "" {
+			continue // not a namespaced component
+		}
+		if _, seen := groups[override]; !seen {
+			groupOrder = append(groupOrder, override)
+		}
+		groups[override] = append(groups[override], schemeEntry{namespacedName: name, scheme: scheme})
+	}
+
+	// For each group, check if all entries are equivalent
+	renameMappings := make(map[string]string) // namespacedName -> originalName
+	removals := make(map[string]bool)
+
+	for _, originalName := range groupOrder {
+		entries := groups[originalName]
+
+		if len(entries) == 1 {
+			// Unique scheme (only in one document): strip namespace, rename back to original
+			entry := entries[0]
+			renameMappings[entry.namespacedName] = originalName
+			if entry.scheme.Object.Extensions != nil {
+				entry.scheme.Object.Extensions.Delete("x-speakeasy-name-override")
+				entry.scheme.Object.Extensions.Delete("x-speakeasy-model-namespace")
+			}
+			continue
+		}
+
+		// Check if all entries are mergeable (type-aware check)
+		allMergeable := true
+		for i := 1; i < len(entries); i++ {
+			if !areMergeableSecuritySchemes(entries[0].scheme.Object, entries[i].scheme.Object) {
+				allMergeable = false
+				break
+			}
+		}
+
+		if !allMergeable {
+			continue
+		}
+
+		// All mergeable: keep the last entry, merge content, remove others
+		winner := entries[len(entries)-1]
+
+		// Merge descriptions (append across all entries) and scopes (union for oauth2)
+		mergeSecuritySchemeDescriptions(winner.scheme.Object, entries)
+		mergeOAuth2Scopes(winner.scheme.Object, entries)
+
+		for _, entry := range entries {
+			renameMappings[entry.namespacedName] = originalName
+			if entry.namespacedName != winner.namespacedName {
+				removals[entry.namespacedName] = true
+			}
+		}
+
+		// Clean up the x-speakeasy-* extensions from the winner since it's no longer namespaced
+		if winner.scheme.Object.Extensions != nil {
+			winner.scheme.Object.Extensions.Delete("x-speakeasy-name-override")
+			winner.scheme.Object.Extensions.Delete("x-speakeasy-model-namespace")
+		}
+	}
+
+	if len(renameMappings) == 0 {
+		return
+	}
+
+	// Rebuild the security schemes map: remove duplicates, rename winner
+	newSchemes := sequencedmap.New[string, *openapi.ReferencedSecurityScheme]()
+	for name, scheme := range doc.Components.SecuritySchemes.All() {
+		if removals[name] {
+			continue
+		}
+		if newName, ok := renameMappings[name]; ok {
+			newSchemes.Set(newName, scheme)
+		} else {
+			newSchemes.Set(name, scheme)
+		}
+	}
+	doc.Components.SecuritySchemes = newSchemes
+
+	// Update security requirements throughout the document
+	updateSecurityRequirements(doc, renameMappings)
+}
+
+func setOperationServers(doc *openapi.OpenAPI, opServers []*openapi.Server) {
 	if doc.Paths == nil {
 		return
 	}
 
-	for pair := orderedmap.First(doc.Paths.PathItems); pair != nil; pair = pair.Next() {
-		pathItem := pair.Value()
-		ops := pathItem.GetOperations()
+	for _, pathItem := range doc.Paths.All() {
+		if pathItem.Object == nil {
+			continue
+		}
 
-		for pair := orderedmap.First(ops); pair != nil; pair = pair.Next() {
-			op := pair.Value()
-
-			op.Servers, _ = mergeServers(op.Servers, opServers, false)
+		for _, op := range pathItem.Object.All() {
+			if op != nil {
+				op.Servers, _ = mergeServers(op.Servers, opServers, false)
+			}
 		}
 	}
 }

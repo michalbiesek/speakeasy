@@ -1,7 +1,6 @@
 package run
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	stdErrors "errors"
@@ -11,18 +10,28 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/samber/lo"
 	"gopkg.in/yaml.v3"
 
 	"github.com/speakeasy-api/openapi-generation/v2/pkg/generate"
 	"github.com/speakeasy-api/sdk-gen-config/workflow"
+	core "github.com/speakeasy-api/speakeasy-core/auth"
 	"github.com/speakeasy-api/speakeasy-core/errors"
 	"github.com/speakeasy-api/speakeasy-core/events"
 	"github.com/speakeasy-api/speakeasy/internal/charm/styles"
+	"github.com/speakeasy-api/speakeasy/internal/github"
 	"github.com/speakeasy-api/speakeasy/internal/log"
 	"github.com/speakeasy-api/speakeasy/internal/utils"
 	"github.com/speakeasy-api/speakeasy/internal/workflowTracking"
+	"github.com/speakeasy-api/versioning-reports/versioning"
 )
+
+const ErrNoRollback = errors.Error("failed with error that shouldn't be rolled back")
+
+type SourceStep interface {
+	Do(ctx context.Context, inputPath string) (string, error)
+}
 
 const speakeasySelf = "speakeasy-self"
 
@@ -32,7 +41,7 @@ func ParseSourcesAndTargets() ([]string, []string, error) {
 		return nil, nil, err
 	}
 
-	if err := wf.Validate(generate.GetSupportedLanguages()); err != nil {
+	if err := wf.Validate(generate.GetSupportedTargetNames()); err != nil {
 		return nil, nil, err
 	}
 
@@ -59,6 +68,11 @@ func (w *Workflow) RunWithVisualization(ctx context.Context) error {
 	logger := log.From(ctx)
 	var logs bytes.Buffer
 	warnings := make([]string, 0)
+
+	if w.BoostrapTests {
+		msg := styles.MakeBoxed(styles.MakeBold(fmt.Sprintf("🚀 %s 🚀", styles.Info.Render("Bootstrapping Tests"))), styles.Colors.Green, lipgloss.Center)
+		logger.Println(msg)
+	}
 
 	logCapture := logger.WithWriter(&logs).WithWarnCapture(&warnings) // Swallow but retain the logs to be displayed later, upon failure
 	updatesChannel := make(chan workflowTracking.UpdateMsg)
@@ -121,6 +135,35 @@ func (w *Workflow) Run(ctx context.Context) error {
 
 	enrichTelemetryWithCompletedWorkflow(ctx, w)
 
+	// Add execution ID as hidden comment at bottom of PR description
+	if cliEvent := events.GetTelemetryEventFromContext(ctx); cliEvent != nil && cliEvent.ExecutionID != "" {
+		_ = versioning.AddVersionReport(ctx, versioning.VersionReport{
+			Key:      "execution_id",
+			PRReport: github.ExecutionIDComment(cliEvent.ExecutionID),
+			Priority: 0, // Lowest priority -- place at bottom
+		})
+	}
+
+	// If there's an error and telemetry is not disabled, show repro message
+	if err != nil && !utils.IsZeroTelemetryOrganization(ctx) {
+		cliEvent := events.GetTelemetryEventFromContext(ctx)
+		if cliEvent != nil && cliEvent.ExecutionID != "" && cliEvent.SourceNamespaceName != nil && *cliEvent.SourceNamespaceName != "" {
+			logger := log.From(ctx)
+			logger.Errorf("\nTo get help, send the following reproduction command to the Speakeasy team:")
+
+			// Get org and workspace slugs from context
+			orgSlug := core.GetOrgSlugFromContext(ctx)
+			workspaceSlug := core.GetWorkspaceSlugFromContext(ctx)
+
+			if orgSlug != "" && workspaceSlug != "" {
+				logger.Errorf("\n    speakeasy repro %s_%s_%s\n", orgSlug, workspaceSlug, cliEvent.ExecutionID)
+			} else {
+				// Fallback if we can't get org/workspace info
+				logger.Errorf("\n    speakeasy repro {org-slug}_{workspace-slug}_%s\n", cliEvent.ExecutionID)
+			}
+		}
+	}
+
 	return err
 }
 
@@ -142,6 +185,10 @@ func (w *Workflow) RunInner(ctx context.Context) error {
 		return fmt.Errorf("cannot manually apply a version when more than one target is specified ")
 	}
 
+	if w.SourceLocation != "" && len(sourceIDs) > 1 {
+		return fmt.Errorf("cannot specify a source location when more than one source is required")
+	}
+
 	for _, sourceID := range sourceIDs {
 		if sourceID == "" {
 			continue
@@ -149,7 +196,7 @@ func (w *Workflow) RunInner(ctx context.Context) error {
 		if _, ok := w.workflow.Sources[sourceID]; !ok {
 			return fmt.Errorf("source '%s' not found", sourceID)
 		}
-		_, _, err := w.RunSource(ctx, w.RootStep, sourceID, "")
+		_, _, err := w.RunSource(ctx, w.RootStep, sourceID, "", "")
 		if err != nil {
 			return err
 		}
@@ -180,7 +227,7 @@ func (w *Workflow) RunInner(ctx context.Context) error {
 }
 
 func (w *Workflow) Cleanup() {
-	os.RemoveAll(workflow.GetTempDir())
+	_ = os.RemoveAll(workflow.GetTempDir())
 }
 
 func (w *Workflow) printGenerationOverview(ctx context.Context) error {
@@ -212,8 +259,12 @@ func (w *Workflow) printGenerationOverview(ctx context.Context) error {
 		additionalLines = append(additionalLines, "Review all targets with `speakeasy status`.")
 	}
 
-	if t.CodeSamples != nil {
+	// Covers the case where code samples are configured to be written to a local file
+	if t.CodeSamples != nil && t.CodeSamples.Output != "" {
 		additionalLines = append(additionalLines, fmt.Sprintf("Code samples overlay file written to %s", t.CodeSamples.Output))
+		// Covers the case where code samples are configured to be published to a registry URI
+	} else if t.CodeSamples != nil && t.CodeSamples.Registry != nil {
+		additionalLines = append(additionalLines, fmt.Sprintf("Code samples uploaded to: %s", string(t.CodeSamples.Registry.Location)))
 	}
 
 	if len(w.criticalWarns) > 0 {
@@ -221,7 +272,7 @@ func (w *Workflow) printGenerationOverview(ctx context.Context) error {
 	}
 
 	msg := styles.RenderSuccessMessage(
-		fmt.Sprintf("%s", "Generation Summary"),
+		"Generation Summary",
 		additionalLines...,
 	)
 	logger.Println(msg)
@@ -251,23 +302,6 @@ func (w *Workflow) printGenerationOverview(ctx context.Context) error {
 	return nil
 }
 
-func filterLogs(ctx context.Context, logBuffer *bytes.Buffer) string {
-	logger := log.From(ctx)
-	var filteredLogs strings.Builder
-	scanner := bufio.NewScanner(logBuffer)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.Contains(line, "ERROR") || strings.Contains(line, "WARN") {
-			filteredLogs.WriteString(line + "\n")
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		logger.Errorf("Failed to format question: %s", err)
-	}
-
-	return filteredLogs.String()
-}
-
 func enrichTelemetryWithCompletedWorkflow(ctx context.Context, w *Workflow) {
 	cliEvent := events.GetTelemetryEventFromContext(ctx)
 	if cliEvent != nil {
@@ -284,6 +318,15 @@ func enrichTelemetryWithCompletedWorkflow(ctx context.Context, w *Workflow) {
 			lockFileOldBytes, _ := yaml.Marshal(w.lockfileOld)
 			lockFileOldString := string(lockFileOldBytes)
 			cliEvent.WorkflowLockPreRaw = &lockFileOldString
+		}
+		// Capture the workflow YAML content
+		workflowBytes, _ := yaml.Marshal(w.workflow)
+		workflowString := string(workflowBytes)
+		cliEvent.WorkflowPostRaw = &workflowString
+
+		// Set the original workflow content if available
+		if w.workflowRaw != "" {
+			cliEvent.WorkflowPreRaw = &w.workflowRaw
 		}
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"math/rand"
 	"mime"
 	"net/http"
 	"os"
@@ -36,8 +35,10 @@ const (
 	bundleCacheTime = time.Hour * 24 * 7
 )
 
-var allowedDocumentExtensions = []string{".yaml", ".yml", ".json"}
-var ErrUnknownDocumentType = fmt.Errorf("unrecognized document extension")
+var (
+	allowedDocumentExtensions = []string{".yaml", ".yml", ".json"}
+	ErrUnknownDocumentType    = fmt.Errorf("unrecognized document extension")
+)
 
 type DownloadedRegistryOpenAPIBundle struct {
 	LocalFilePath     string
@@ -45,78 +46,6 @@ type DownloadedRegistryOpenAPIBundle struct {
 	ManifestReference string
 	ManifestDigest    string
 	BlobDigest        string
-}
-
-func Fetch(url, header, token string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	if header != "" {
-		if token == "" {
-			return nil, fmt.Errorf("token required for header")
-		}
-		req.Header.Add(header, token)
-	}
-
-	var res *http.Response
-	for i := 0; i < maxAttempts; i++ {
-		res, err = http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("failed to download file: %w", err)
-		}
-
-		// retry for any 5xx status code
-		if res.StatusCode < 500 || res.StatusCode > 599 || i >= maxAttempts-1 {
-			break
-		}
-
-		res.Body.Close()
-		jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
-		time.Sleep(baseDelay*time.Duration(i+1) + jitter)
-	}
-
-	var resErr error
-	switch res.StatusCode {
-	case 204:
-		fallthrough
-	case 404:
-		resErr = fmt.Errorf("file not found")
-	case 401:
-		resErr = fmt.Errorf("unauthorized, please ensure auth_header and auth_token inputs are set correctly and a valid token has been provided")
-	default:
-		if res.StatusCode/100 != 2 {
-			resErr = fmt.Errorf("failed to download file: %s", res.Status)
-		}
-	}
-
-	if resErr != nil {
-		defer res.Body.Close()
-		return nil, resErr
-	}
-
-	return res, nil
-}
-
-func DownloadFile(url, outPath, header, token string) error {
-	res, err := Fetch(url, header, token)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-
-	out, err := os.Create(outPath)
-	if err != nil {
-		return fmt.Errorf("failed to create file for download: %w", err)
-	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, res.Body); err != nil {
-		return fmt.Errorf("failed to copy file to location: %w", err)
-	}
-
-	return nil
 }
 
 func documentKey(document workflow.SpeakeasyRegistryDocument) string {
@@ -241,7 +170,7 @@ func DownloadRegistryOpenAPIBundle(ctx context.Context, document workflow.Speake
 	outPath = filepath.Join(outPath, shortDigest)
 
 	var outputFileName string
-	if fileName, _ := bundleCache.BundleAnnotations[ocicommon.AnnotationBundleRoot]; fileName != "" {
+	if fileName := bundleCache.BundleAnnotations[ocicommon.AnnotationBundleRoot]; fileName != "" {
 		cleanName := filepath.Clean(fileName)
 		outputFileName = filepath.Join(outPath, cleanName)
 		err = os.MkdirAll(filepath.Dir(outputFileName), os.ModePerm)

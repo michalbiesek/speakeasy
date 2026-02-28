@@ -5,14 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/speakeasy-api/speakeasy/internal/utils"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/speakeasy-api/speakeasy/internal/utils"
 
 	"github.com/speakeasy-api/speakeasy/cmd"
 	"github.com/speakeasy-api/versioning-reports/versioning"
@@ -27,37 +27,88 @@ import (
 // If all test groups are run at the same time you will see test failures.
 
 func TestWorkflowWithEnvVar(t *testing.T) {
-	temp := setupTestDir(t)
-
-	// Create workflow file and associated resources
-	workflowFile := &workflow.Workflow{
-		Version: workflow.WorkflowVersion,
-		Sources: make(map[string]workflow.Source),
-		Targets: make(map[string]workflow.Target),
-	}
-	workflowFile.Sources["first-source"] = workflow.Source{
-		Inputs: []workflow.Document{
-			{
-				Location: workflow.LocationString("${MY_ENV_VAR}"),
+	tests := []struct {
+		name     string
+		env      map[string]string
+		location workflow.LocationString
+		want     string
+	}{
+		{
+			name: "simple substitution",
+			env: map[string]string{
+				"MY_FILE_FULL_PATH": "spec.yaml",
 			},
+			location: workflow.LocationString("${MY_FILE_FULL_PATH}"),
+			want:     "spec.yaml",
+		},
+		{
+			name: "fallback substitution",
+			env: map[string]string{
+				"MY_FILE_PATH": "",
+				"MY_FILE_EXT":  "",
+			},
+			location: workflow.LocationString("${MY_FILE_PATH:-spec}.${MY_FILE_EXT:-yaml}"),
+			want:     "spec.yaml",
+		},
+		{
+			name: "colon plus substitution",
+			env: map[string]string{
+				"MY_FILE_APPEND": "enabled",
+			},
+			location: workflow.LocationString("spec${MY_FILE_APPEND:+.yaml}"),
+			want:     "spec.yaml",
+		},
+		{
+			name: "multiple substitutions",
+			env: map[string]string{
+				"MY_FILE_DIR":  "specs",
+				"MY_FILE_NAME": "spec",
+				"MY_FILE_EXT":  "yaml",
+			},
+			location: workflow.LocationString("${MY_FILE_DIR}/${MY_FILE_NAME}.${MY_FILE_EXT}"),
+			want:     "specs/spec.yaml",
 		},
 	}
-	workflowFile.Targets["test-target"] = workflow.Target{
-		Target: "typescript",
-		Source: "first-source",
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			temp := t.TempDir()
+
+			for key, value := range tt.env {
+				t.Setenv(key, value)
+			}
+
+			resolved := tt.location.Resolve()
+			require.Equal(t, tt.want, resolved)
+
+			workflowFile := &workflow.Workflow{
+				Version: workflow.WorkflowVersion,
+				Sources: make(map[string]workflow.Source),
+				Targets: make(map[string]workflow.Target),
+			}
+			workflowFile.Sources["first-source"] = workflow.Source{
+				Inputs: []workflow.Document{
+					{Location: tt.location},
+				},
+			}
+			workflowFile.Targets["test-target"] = workflow.Target{
+				Target: "typescript",
+				Source: "first-source",
+			}
+
+			require.NoError(t, os.MkdirAll(filepath.Join(temp, ".speakeasy"), 0o755))
+			require.NoError(t, workflow.Save(temp, workflowFile))
+
+			destPath := filepath.Join(temp, resolved)
+			require.NoError(t, os.MkdirAll(filepath.Dir(destPath), 0o755))
+			require.NoError(t, copyFile(filepath.Join("resources", "spec.yaml"), destPath))
+
+			require.NoError(t, execute(t, temp, "run", "-t", "all", "--pinned", "--skip-compile").Run())
+
+			_, err := os.Stat(filepath.Join(temp, "README.md"))
+			require.NoError(t, err)
+		})
 	}
-
-	err := os.MkdirAll(filepath.Join(temp, ".speakeasy"), 0o755)
-	require.NoError(t, err)
-	err = workflow.Save(temp, workflowFile)
-
-	require.NoError(t, os.Setenv("MY_ENV_VAR", "spec.yaml"))
-	require.NoError(t, copyFile(filepath.Join("resources", "spec.yaml"), filepath.Join(temp, "spec.yaml")))
-
-	require.NoError(t, execute(t, temp, "run", "-t", "all", "--pinned", "--skip-compile").Run())
-	// check README.md exists
-	_, err = os.Stat(filepath.Join(temp, "README.md"))
-	require.NoError(t, err)
 }
 
 func TestGenerationWorkflows(t *testing.T) {
@@ -117,7 +168,7 @@ func TestGenerationWorkflows(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			temp := setupTestDir(t)
+			temp := t.TempDir()
 
 			// Create workflow file and associated resources
 			workflowFile := &workflow.Workflow{
@@ -180,7 +231,7 @@ func TestGenerationWorkflows(t *testing.T) {
 
 func TestInputOnlyWorkflow(t *testing.T) {
 	t.Parallel()
-	temp := setupTestDir(t)
+	temp := t.TempDir()
 
 	// Create workflow file and associated resources
 	workflowFile := &workflow.Workflow{
@@ -227,12 +278,14 @@ func (r *subprocessRunner) Run() error {
 	return nil
 }
 
-func execute(t *testing.T, wd string, args ...string) Runnable {
+func execute(t *testing.T, wd string, args ...string) Runnable { //nolint:iface // Interface intentional for test flexibility
 	t.Helper()
-	_, filename, _, _ := runtime.Caller(0)
-	baseFolder := filepath.Join(filepath.Dir(filename), "..")
-	mainGo := filepath.Join(baseFolder, "main.go")
-	execCmd := exec.Command("go", append([]string{"run", mainGo}, args...)...)
+
+	// Build the binary lazily on first execute() call
+	binaryPath, err := ensureBinary()
+	require.NoError(t, err, "failed to build speakeasy binary")
+
+	execCmd := exec.Command(binaryPath, args...)
 	execCmd.Env = os.Environ()
 	execCmd.Dir = wd
 
@@ -248,37 +301,44 @@ func execute(t *testing.T, wd string, args ...string) Runnable {
 }
 
 // executeI is a helper function to execute the main.go file inline. It can help when debugging integration tests
-var mutex sync.Mutex
-var rootCmd = cmd.CmdForTest(version, artifactArch)
+// We should not use it on multiple tests at once as they will share memory: this can create issues.
+// so we leave it around as a little helper method: swap out execute for executeI and debug breakpoints work
+var (
+	mutex   sync.Mutex                              //nolint:unused // Reserved for executeI debugging helper
+	rootCmd = cmd.CmdForTest(version, artifactArch) //nolint:unused // Reserved for executeI debugging helper
+)
 
-func executeI(t *testing.T, wd string, args ...string) Runnable {
+func executeI(t *testing.T, wd string, args ...string) *cmdRunner { //nolint:unused // Helper function for debugging integration tests
+	t.Helper()
 	mutex.Lock()
 	t.Helper()
 	rootCmd.SetArgs(args)
 	oldWD, err := os.Getwd()
 	require.NoError(t, err)
-	require.NoError(t, os.Chdir(wd))
+	t.Chdir(wd)
 
 	return &cmdRunner{
 		rootCmd: rootCmd,
 		cleanup: func() {
-			require.NoError(t, os.Chdir(oldWD))
+			t.Chdir(oldWD)
 			mutex.Unlock()
 		},
 	}
 }
 
-type cmdRunner struct {
+type cmdRunner struct { //nolint:unused // Reserved for executeI debugging helper
 	rootCmd *cobra.Command
 	cleanup func()
 }
 
-func (c *cmdRunner) Run() error {
+func (c *cmdRunner) Run() error { //nolint:unused // Reserved for executeI debugging helper
 	defer c.cleanup()
 	return c.rootCmd.Execute()
 }
 
 func TestSpecWorkflows(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name            string
 		inputDocs       []string
@@ -419,11 +479,23 @@ func TestSpecWorkflows(t *testing.T) {
 				"/pet/findByTags",
 			},
 		},
+		{
+			name: "test automatic swagger 2.0 conversion",
+			inputDocs: []string{
+				"swagger.yaml",
+			},
+			out: "output.yaml",
+			expectedPaths: []string{
+				"/pet",
+				"/store/inventory",
+				"/user/login",
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			temp := setupTestDir(t)
+			temp := t.TempDir()
 			// Create workflow file and associated resources
 			workflowFile := &workflow.Workflow{
 				Version: workflow.WorkflowVersion,
@@ -509,6 +581,8 @@ func TestSpecWorkflows(t *testing.T) {
 }
 
 func TestFallbackCodeSamplesWorkflow(t *testing.T) {
+	t.Parallel()
+
 	spec := `{
 		"openapi": "3.0.0",
 		"info": {
@@ -554,7 +628,7 @@ func TestFallbackCodeSamplesWorkflow(t *testing.T) {
 		}
 	}`
 	// Write the spec to a temp file
-	temp := setupTestDir(t)
+	temp := t.TempDir()
 	specPath := filepath.Join(temp, "spec.yaml")
 	err := os.WriteFile(specPath, []byte(spec), 0o644)
 	require.NoError(t, err)
@@ -598,7 +672,7 @@ func TestFallbackCodeSamplesWorkflow(t *testing.T) {
 	})
 	require.NoError(t, cmdErr)
 	require.NotNil(t, reports)
-	require.True(t, len(reports.Reports) > 0, "must have version reports")
+	require.NotEmpty(t, reports.Reports, "must have version reports")
 	require.Truef(t, reports.MustGenerate(), "must have gen.lock")
 
 	require.NoError(t, cmdErr)

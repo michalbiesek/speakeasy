@@ -3,12 +3,9 @@ package prompts
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
-
-	"github.com/speakeasy-api/speakeasy/internal/charm/styles"
 
 	"github.com/iancoleman/strcase"
 	"github.com/pkg/errors"
@@ -27,6 +24,11 @@ var additionalRelevantConfigs = []string{
 // During quickstart we ask for a limited subset of configs per language
 var quickstartScopedKeys = map[string][]string{
 	"go": {
+		"modulePath",
+		"sdkPackageName",
+	},
+	"mcp-typescript": {
+		"cloudflareEnabled",
 		"packageName",
 	},
 	"typescript": {
@@ -54,7 +56,7 @@ var quickstartScopedKeys = map[string][]string{
 	},
 	"ruby": {
 		"packageName",
-		"author",
+		"module",
 	},
 }
 
@@ -88,21 +90,7 @@ func PromptForTargetConfig(targetName string, wf *workflow.Workflow, target *wor
 	initialFields := []huh.Field{}
 
 	if quickstart == nil || quickstart.SDKName == "" {
-		initialFields = append(initialFields,
-			huh.NewInput().
-				Title("Name your SDK").
-				Description("This should be PascalCase. Your users will access SDK methods with myCompanySDK.doThing()\n").
-				Placeholder("MyCompanySDK").
-				Suggestions(suggestions).
-				Prompt("").
-				Validate(func(s string) error {
-					if strings.TrimSpace(s) == "" {
-						return errors.New("SDK name must not be empty")
-					}
-					return nil
-				}).
-				Value(&sdkClassName),
-		)
+		initialFields = append(initialFields, createSDKNamePrompt(&sdkClassName, suggestions))
 	} else {
 		sdkClassName = strcase.ToCamel(quickstart.SDKName)
 	}
@@ -112,17 +100,11 @@ func PromptForTargetConfig(targetName string, wf *workflow.Workflow, target *wor
 		baseServerURL = output.Generation.BaseServerURL
 	}
 	if !isQuickstart && target.Target != "postman" {
-		initialFields = append(initialFields, huh.NewInput().
-			Title("Provide a base server URL for your SDK to use:").
-			Placeholder("You must do this if a server URL is not defined in your OpenAPI spec").
-			Inline(true).
-			Prompt(" ").
-			Value(&baseServerURL))
+		initialFields = append(initialFields, createBaseServerURLPrompt(&baseServerURL))
 	}
 
-	formTitle := fmt.Sprintf("Let's configure your %s target (%s)", target.Target, targetName)
-	formSubtitle := "This will configure a config file that defines parameters for how your SDK is generated. \n" +
-		"Default config values have been provided. You only need to edit values that you want to modify."
+	formTitle := getFormTitle(target.Target, targetName)
+	formSubtitle := getFormSubtitle(target.Target)
 
 	if len(initialFields) > 0 {
 		form := huh.NewForm(huh.NewGroup(initialFields...))
@@ -141,20 +123,20 @@ func PromptForTargetConfig(targetName string, wf *workflow.Workflow, target *wor
 		return nil, err
 	}
 
-	languageGroups, fields, err := languageSpecificForms(target.Target, output, defaultConfigs, isQuickstart, sdkClassName)
+	targetFormGroups, targetFormFields, err := TargetSpecificForms(target.Target, output, defaultConfigs, quickstart, sdkClassName)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(languageGroups) > 0 {
-		form := huh.NewForm(languageGroups...)
+	if len(targetFormGroups) > 0 {
+		form := huh.NewForm(targetFormGroups...)
 		if _, err := charm.NewForm(form, charm.WithTitle(formTitle), charm.WithDescription(formSubtitle)).
 			ExecuteForm(); err != nil {
 			return nil, err
 		}
-
-		saveLanguageConfigValues(target.Target, form, output, fields, defaultConfigs)
 	}
+
+	saveLanguageConfigValues(target.Target, output, targetFormFields)
 
 	output.Generation.SDKClassName = sdkClassName
 	output.Generation.BaseServerURL = baseServerURL
@@ -171,7 +153,7 @@ func PromptForTargetConfig(targetName string, wf *workflow.Workflow, target *wor
 func setDevContainerDefaults(output *config.Configuration, wf *workflow.Workflow, target *workflow.Target) {
 	if target.Target == "go" || target.Target == "typescript" || target.Target == "python" {
 		if source, ok := wf.Sources[target.Source]; ok {
-			schemaPath := ""
+			var schemaPath string
 			if source.Output != nil {
 				schemaPath = *source.Output
 			} else {
@@ -186,7 +168,7 @@ func setDevContainerDefaults(output *config.Configuration, wf *workflow.Workflow
 }
 
 func setEnvVarPrefixDefaults(output *config.Configuration, target *workflow.Target, sdkClassName string) {
-	if target.Target == "go" || target.Target == "typescript" || target.Target == "python" {
+	if target.Target == "go" || target.Target == "typescript" || target.Target == "python" || target.Target == "mcp-typescript" {
 		if cfg, ok := output.Languages[target.Target]; ok && cfg.Cfg != nil {
 			cfg.Cfg["envVarPrefix"] = strings.ToUpper(sdkClassName)
 		}
@@ -203,216 +185,180 @@ func configBaseForm(ctx context.Context, quickstart *Quickstart) (*QuickstartSta
 		quickstart.LanguageConfigs[key] = output
 	}
 
-	var nextState QuickstartState = Complete
+	nextState := Complete
 	return &nextState, nil
 }
 
-type LangField struct {
-	key          string
-	defaultValue string
-}
-
-func languageSpecificForms(
-	language string,
+func TargetSpecificForms(
+	targetName string,
 	existingConfig *config.Configuration,
 	configFields []config.SDKGenConfigField,
-	isQuickstart bool,
+	quickstart *Quickstart,
 	sdkClassName string,
-) ([]*huh.Group, []LangField, error) {
+) ([]*huh.Group, TargetFormFields, error) {
 	langConfig := config.LanguageConfig{}
 	if existingConfig != nil {
-		if conf, ok := existingConfig.Languages[language]; ok {
+		if conf, ok := existingConfig.Languages[targetName]; ok {
 			langConfig = conf
 		}
 	}
 
 	var groups []*huh.Group
+	isQuickstart := quickstart != nil
+	targetFormFields := make(TargetFormFields)
+	targetQuickstartFieldNames, ok := quickstartScopedKeys[targetName]
 
-	var fields []LangField
+	if !ok {
+		targetQuickstartFieldNames = []string{}
+	}
+
 	for _, field := range configFields {
 		if slices.Contains(ignoredKeys, field.Name) {
 			continue
 		}
 
-		valid, defaultValue, validateRegex, validateMessage, descriptionFn := getValuesForField(field, langConfig, language, sdkClassName, isQuickstart)
+		if isQuickstart && !slices.Contains(targetQuickstartFieldNames, field.Name) {
+			continue
+		}
 
-		if valid {
-			if lang, ok := quickstartScopedKeys[language]; (ok && slices.Contains(lang, field.Name)) || (!isQuickstart && slices.Contains(additionalRelevantConfigs, field.Name)) {
-				fields = append(fields, LangField{
-					key:          field.Name,
-					defaultValue: defaultValue,
-				})
-				groups = append(groups, addPromptForField(field.Name, defaultValue, validateRegex, validateMessage, descriptionFn))
+		if !isQuickstart && !slices.Contains(additionalRelevantConfigs, field.Name) {
+			continue
+		}
+
+		_, err := targetFormFields.Add(field, langConfig, targetName, sdkClassName, quickstart)
+		if err != nil {
+			return groups, targetFormFields, err
+		}
+	}
+
+	if isQuickstart && quickstart.SkipInteractive {
+		return groups, targetFormFields, nil
+	}
+
+	// configFields ordering is non-deterministic, so its important to collect
+	// the fields then deterministically add them to the form for fields that
+	// intentionally reference previously answered fields.
+	for _, name := range targetQuickstartFieldNames {
+		if field, ok := targetFormFields[name]; ok {
+			// Always call HuhField to trigger ValueFunc (computes derived values like sdkPackageName)
+			f := field.HuhField(targetFormFields)
+			if f == nil {
+				return groups, targetFormFields, fmt.Errorf("field %s is not valid", name)
 			}
+
+			// Skip adding to form groups if value was provided via CLI flags
+			if isQuickstart && shouldSkipField(name, quickstart) {
+				continue
+			}
+
+			groups = append(groups, huh.NewGroup(f))
 		}
 	}
 
-	return groups, fields, nil
+	for _, name := range additionalRelevantConfigs {
+		if field, ok := targetFormFields[name]; ok {
+			f := field.HuhField(targetFormFields)
+			if f != nil {
+				groups = append(groups, huh.NewGroup(f))
+				continue
+			}
+			return groups, targetFormFields, fmt.Errorf("field %s is not valid", name)
+		}
+	}
+
+	return groups, targetFormFields, nil
 }
 
-func getValuesForField(
-	field config.SDKGenConfigField,
-	langConfig config.LanguageConfig,
-	language string,
-	sdkClassName string,
-	isQuickstart bool,
-) (
-	valid bool,
-	defaultValue string,
-	validationRegex string,
-	validationMessage string,
-	descriptionFn func(v string) string,
-) {
-	if field.Name == "maxMethodParams" {
-	}
-	if field.DefaultValue != nil {
-		// We only support string and boolean fields at this particular moment, more to come.
-		switch val := (*field.DefaultValue).(type) {
-		case string:
-			defaultValue = val
-		case int:
-			defaultValue = strconv.Itoa(val)
-		case int64:
-			defaultValue = strconv.FormatInt(val, 10)
-		case bool:
-			defaultValue = strconv.FormatBool(val)
-		default:
-			return false, "", "", "", nil
-		}
-	}
-
-	// Choose an existing default val if possible
-	if value, ok := langConfig.Cfg[field.Name]; ok {
-		switch val := value.(type) {
-		case string:
-			defaultValue = val
-		case int:
-			defaultValue = strconv.Itoa(val)
-		case int64:
-			defaultValue = strconv.FormatInt(val, 10)
-		case bool:
-			defaultValue = strconv.FormatBool(val)
-		}
-	}
-
-	if field.ValidationRegex != nil {
-		validationRegex = *field.ValidationRegex
-		validationRegex = strings.Replace(validationRegex, `\u002f`, `/`, -1)
-	}
-
-	if field.ValidationRegex != nil {
-		validationMessage = *field.ValidationMessage
-	}
-
-	description := ""
-	if field.Description != nil {
-		description = *field.Description
-	}
-	if field.Name == "packageName" && isQuickstart && sdkClassName != "" {
-		switch language {
-		case "go":
-			defaultValue = "github.com/my-company/" + strcase.ToKebab(sdkClassName)
-			description = description + "\nTo install your SDK, users will execute " + styles.Emphasized.Render("go get %s")
-		case "typescript":
-			defaultValue = strcase.ToKebab(sdkClassName)
-			description = description + "\nTo install your SDK, users will execute " + styles.Emphasized.Render("npm install %s")
-		case "python":
-			defaultValue = strcase.ToKebab(sdkClassName)
-			description = description + "\nTo install your SDK, users will execute " + styles.Emphasized.Render("pip install %s")
-		case "terraform":
-			defaultValue = strcase.ToKebab(sdkClassName)
-		}
-	}
-
-	descriptionFn = func(v string) string {
-		if strings.Contains(description, "%s") {
-			return fmt.Sprintf(description, v)
-		} else {
-			return description
-		}
-	}
-
-	valid = true
-	return
-}
-
-func addPromptForField(key, defaultValue, validateRegex, validateMessage string, descriptionFn func(v string) string) *huh.Group {
-	value := defaultValue
-
-	input := charm.NewInlineInput(&value).
-		Key(key).
-		Title(fmt.Sprintf("Choose a %s", key)).
+func createSDKNamePrompt(sdkClassName *string, suggestions []string) huh.Field {
+	return huh.NewInput().
+		Title("Name your SDK").
+		Description("This should be PascalCase. Your users will access SDK methods with myCompanySDK.doThing()\n").
+		Placeholder("MyCompanySDK").
+		Suggestions(suggestions).
+		Prompt("").
 		Validate(func(s string) error {
-			if validateRegex != "" {
-				s = strings.TrimSpace(s)
-				s = strings.Trim(s, "\n")
-				s = strings.Trim(s, "\t")
-				r, err := regexp.Compile(validateRegex)
-				if err != nil {
-					return err
-				}
-				if !r.MatchString(s) {
-					return errors.New(validateMessage)
-				}
+			if strings.TrimSpace(s) == "" {
+				return errors.New("SDK name must not be empty")
 			}
 			return nil
-		})
+		}).
+		Value(sdkClassName)
+}
 
-	if descriptionFn != nil {
-		fn := func() string {
-			return descriptionFn(value)
-		}
-		input = input.DescriptionFunc(fn, &value).Inline(false).Prompt("")
-	}
-
-	return huh.NewGroup(input)
+func createBaseServerURLPrompt(baseServerURL *string) huh.Field {
+	return huh.NewInput().
+		Title("Provide a base server URL for your SDK to use:").
+		Placeholder("You must do this if a server URL is not defined in your OpenAPI spec").
+		Inline(true).
+		Prompt(" ").
+		Value(baseServerURL)
 }
 
 func saveLanguageConfigValues(
-	language string,
-	form *huh.Form,
+	targetName string,
 	configuration *config.Configuration,
-	fields []LangField,
-	configFields []config.SDKGenConfigField,
+	targetFormFields TargetFormFields,
 ) {
-	for _, formField := range fields {
-		key := formField.key
-		var field *config.SDKGenConfigField
-
-		for _, f := range configFields {
-			if f.Name == key {
-				field = &f
-				break
-			}
-		}
-		if field != nil {
-			var val any
-			formValue := form.GetString(key)
-			formValue = strings.TrimSpace(formValue)
-			formValue = strings.Trim(formValue, "\n")
-			formValue = strings.Trim(formValue, "\t")
-			if field.DefaultValue != nil {
-				// Use the default value if the actual value is unset
-				if formValue == "" {
-					val = formField.defaultValue
-				} else {
-					// We need to map values back to their native type since the form only can produce a string
-					switch (*field.DefaultValue).(type) {
-					case int:
-						val, _ = strconv.Atoi(formValue)
-					case int64:
-						val, _ = strconv.Atoi(formValue)
-					case bool:
-						val, _ = strconv.ParseBool(formValue)
-					case string:
-						val = formValue
-					}
-				}
+	for fieldName, targetFormField := range targetFormFields {
+		switch value := targetFormField.Value.(type) {
+		case *bool:
+			configuration.Languages[targetName].Cfg[fieldName] = fromPointer(value)
+		case *int:
+			configuration.Languages[targetName].Cfg[fieldName] = fromPointer(value)
+		case *int64:
+			configuration.Languages[targetName].Cfg[fieldName] = fromPointer(value)
+		case *string:
+			// try converting string to int
+			intValue, err := strconv.Atoi(*value)
+			if err == nil {
+				configuration.Languages[targetName].Cfg[fieldName] = intValue
 			} else {
-				val = formValue
+				configuration.Languages[targetName].Cfg[fieldName] = fromPointer(value)
 			}
-
-			configuration.Languages[language].Cfg[key] = val
 		}
 	}
+}
+
+var targetTypeMapping = map[string]string{
+	"mcp-typescript": "MCP Server",
+	"terraform":      "Terraform Provider",
+}
+
+func getTargetDisplayName(targetType string) string {
+	if displayName, exists := targetTypeMapping[targetType]; exists {
+		return displayName
+	}
+	return targetType
+}
+
+func getFormTitle(targetType, targetName string) string {
+	base := "Let's configure your %s target (%s)"
+	return fmt.Sprintf(base, getTargetDisplayName(targetType), targetName)
+}
+
+func getFormSubtitle(targetType string) string {
+	base := "This will configure a config file that defines parameters for how your %s is generated. \n" +
+		"Default config values have been provided. You only need to edit values that you want to modify."
+	return fmt.Sprintf(base, getTargetDisplayName(targetType))
+}
+
+// shouldSkipField returns true if a config field should be skipped because
+// its value was already provided via CLI flags or can be auto-derived.
+func shouldSkipField(fieldName string, quickstart *Quickstart) bool {
+	if quickstart == nil || quickstart.Defaults.PackageName == nil {
+		return false
+	}
+
+	packageNameProvided := *quickstart.Defaults.PackageName != ""
+
+	switch fieldName {
+	case "packageName": // TS, Python, PHP, Ruby, C#, Unity, Terraform, MCP-TS
+		return packageNameProvided
+	case "modulePath": // Go module path (e.g., github.com/company/sdk)
+		return packageNameProvided
+	case "sdkPackageName": // Go - auto-derived from modulePath via ValueFunc
+		return packageNameProvided
+	}
+
+	return false
 }
